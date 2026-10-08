@@ -1,13 +1,16 @@
+in · PY
 import asyncio
 import html
 import io
 import logging
 import os
 import re
+import sqlite3
+import threading
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
-import asyncpg
+ 
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -17,30 +20,31 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, ChatJoinRequest,
                            InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, Message, ReplyKeyboardMarkup)
 from aiohttp import web
-
+ 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("animebot")
-
+ 
 # ----------------------------------------------------------------- CONFIG ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 PORT = int(os.getenv("PORT", "10000"))
-MAIN_ADMIN = int(os.getenv("MAIN_ADMIN_ID", "7041471070"))
-EXTRA_ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "2025400572").replace(" ", "").split(",") if x}
+MAIN_ADMIN_RAW = os.getenv("MAIN_ADMIN_ID", "").strip()
+if not MAIN_ADMIN_RAW.isdigit():
+    raise SystemExit("MAIN_ADMIN_ID environment variable topilmadi yoki raqam emas!")
+MAIN_ADMIN = int(MAIN_ADMIN_RAW)
+EXTRA_ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")  # ixtiyoriy: "Web Animes" tugmasi uchun
 TZ = ZoneInfo("Asia/Tashkent")
-
+ 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN environment variable topilmadi!")
-if not DATABASE_URL:
-    raise SystemExit("DATABASE_URL environment variable topilmadi!")
-
+ 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
-
-pool: asyncpg.Pool = None  # type: ignore
+ 
+pool: "DB" = None  # type: ignore
 BOT_USERNAME = ""
 db_admins: set[int] = set()
 settings: dict[str, str] = {}
@@ -48,7 +52,7 @@ steps: dict[int, str] = {}
 tmp: dict[int, dict] = {}
 bg_tasks: set = set()
 title_cache: dict[str, str] = {}
-
+ 
 DEFAULTS = {
     "key1": "🔎 Anime izlash", "key2": "💎 VIP", "key3": "💰 Hisobim",
     "key4": "➕ Pul kiritish", "key5": "📚 Qo'llanma", "key6": "💵 Reklama va Homiylik",
@@ -56,28 +60,85 @@ DEFAULTS = {
     "homiy": "", "content": "false", "studio_name": "", "instagram": "", "youtube": "",
     "anime_kanal": "@username",
 }
-
+ 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
-    user_id BIGINT PRIMARY KEY, sana TEXT, pul BIGINT DEFAULT 0,
-    banned BOOLEAN DEFAULT FALSE, vip_until TIMESTAMPTZ);
+    user_id INTEGER PRIMARY KEY, sana TEXT, pul INTEGER DEFAULT 0,
+    banned INTEGER DEFAULT 0, vip_until REAL);
 CREATE TABLE IF NOT EXISTS animelar(
-    id SERIAL PRIMARY KEY, nom TEXT, rams TEXT, rams_type TEXT DEFAULT 'photo',
+    id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT, rams TEXT, rams_type TEXT DEFAULT 'photo',
     qismi TEXT, davlat TEXT, tili TEXT, yili TEXT, janri TEXT, ani_type TEXT,
-    qidiruv INT DEFAULT 0, sana TIMESTAMPTZ DEFAULT now());
+    qidiruv INTEGER DEFAULT 0, sana TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS anime_datas(
-    pk SERIAL PRIMARY KEY, anime_id INT, qism INT, file_id TEXT,
-    sana TIMESTAMPTZ DEFAULT now(), UNIQUE(anime_id, qism));
+    pk INTEGER PRIMARY KEY AUTOINCREMENT, anime_id INTEGER, qism INTEGER, file_id TEXT,
+    sana TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(anime_id, qism));
 CREATE TABLE IF NOT EXISTS channels(
-    id SERIAL PRIMARY KEY, channel_id TEXT, channel_type TEXT, channel_link TEXT);
+    id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT, channel_type TEXT, channel_link TEXT);
 CREATE TABLE IF NOT EXISTS join_requests(
-    channel_id TEXT, user_id BIGINT, PRIMARY KEY(channel_id, user_id));
+    channel_id TEXT, user_id INTEGER, PRIMARY KEY(channel_id, user_id));
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS admins(user_id BIGINT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS payments(
-    id SERIAL PRIMARY KEY, name TEXT, wallet TEXT, addition TEXT);
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, wallet TEXT, addition TEXT);
 """
-
+ 
+ 
+def _like(pattern, value):
+    """Unicode'ga mos, katta-kichik harfga e'tiborsiz LIKE."""
+    if pattern is None or value is None:
+        return None
+    rx = re.escape(str(pattern).lower()).replace("%", ".*").replace("_", ".")
+    return 1 if re.fullmatch(rx, str(value).lower(), re.S) else 0
+ 
+ 
+class DB:
+    """SQLite uchun kichik async o'ram ($1, $2 ... uslubidagi so'rovlar bilan)."""
+ 
+    def __init__(self, path: str):
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.create_function("like", 2, _like)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.lock = threading.Lock()
+ 
+    def script(self, sql: str):
+        with self.lock:
+            self.conn.executescript(sql)
+ 
+    def _run(self, sql, args, mode):
+        sql = re.sub(r"\$(\d+)", r":p\1", sql)
+        params = {f"p{i}": v for i, v in enumerate(args, 1)}
+        with self.lock:
+            cur = self.conn.execute(sql, params)
+            rows = cur.fetchall() if cur.description else []
+            self.conn.commit()
+        if mode == "all":
+            return rows
+        if mode == "one":
+            return rows[0] if rows else None
+        if mode == "val":
+            return rows[0][0] if rows else None
+        return None
+ 
+    async def fetch(self, sql, *args):
+        return await asyncio.to_thread(self._run, sql, args, "all")
+ 
+    async def fetchrow(self, sql, *args):
+        return await asyncio.to_thread(self._run, sql, args, "one")
+ 
+    async def fetchval(self, sql, *args):
+        return await asyncio.to_thread(self._run, sql, args, "val")
+ 
+    async def execute(self, sql, *args):
+        await asyncio.to_thread(self._run, sql, args, "none")
+ 
+    def close(self):
+        self.conn.close()
+ 
+ 
 EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF]")
 ADD_FLOW = [
     ("nom", "🍿 Anime nomini kiriting:"),
@@ -92,46 +153,46 @@ EDIT_FIELDS = {"nom": "Nomini", "qismi": "Qismini", "davlat": "Davlatini", "tili
                "yili": "Yilini", "janri": "Janrini", "ani_type": "Fandub nomini"}
 SET_KEYS = {"valyuta": "valyutani", "vip": "VIP narxini (oylik, raqam)", "studio_name": "studia nomini",
             "start": "boshlang'ich matnni", "qollanma": "qo'llanma matnini", "homiy": "homiy matnini"}
-
+ 
 # ---------------------------------------------------------------- HELPERS ---
 def S(key: str) -> str:
     return settings.get(key, DEFAULTS.get(key, ""))
-
-
+ 
+ 
 async def set_setting(key: str, value: str):
     settings[key] = value
     await pool.execute(
         "INSERT INTO settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
         key, value)
-
-
+ 
+ 
 def is_admin(uid: int) -> bool:
     return uid == MAIN_ADMIN or uid in EXTRA_ADMINS or uid in db_admins
-
-
+ 
+ 
 def esc(s) -> str:
     return html.escape(str(s if s is not None else ""))
-
-
+ 
+ 
 def b(text, cb=None, url=None):
     if url:
         return InlineKeyboardButton(text=text, url=url)
     return InlineKeyboardButton(text=text, callback_data=cb)
-
-
+ 
+ 
 def ikb(rows):
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
+ 
+ 
 def rkb(rows):
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t) for t in r] for r in rows], resize_keyboard=True)
-
-
+ 
+ 
 def chunk(items, n):
     return [items[i:i + n] for i in range(0, len(items), n)]
-
-
+ 
+ 
 ADMIN_PANEL = rkb([
     ["*️⃣ Birlamchi sozlamalar"], ["📊 Statistika", "✉ Xabar Yuborish"], ["📬 Post tayyorlash"],
     ["🎥 Animelar sozlash", "💳 Hamyonlar"], ["🔎 Foydalanuvchini boshqarish"],
@@ -140,63 +201,63 @@ BACK_KB = rkb([["🗄 Boshqarish"]])
 ADMIN_TEXTS = {"*️⃣ Birlamchi sozlamalar", "📊 Statistika", "✉ Xabar Yuborish", "📬 Post tayyorlash",
                "🎥 Animelar sozlash", "💳 Hamyonlar", "🔎 Foydalanuvchini boshqarish", "📢 Kanallar",
                "🎛 Tugmalar", "📃 Matnlar", "📋 Adminlar", "🤖 Bot holati"}
-
-
+ 
+ 
 def main_menu(uid: int):
     k = [S(f"key{i}") for i in range(1, 7)]
     rows = [[k[0]], [k[1], k[2]], [k[3], k[4]], [k[5]]]
     if is_admin(uid):
         rows.append(["🗄 Boshqarish"])
     return rkb(rows)
-
-
+ 
+ 
 async def edit(msg: Message, text: str, kb=None):
     try:
         await msg.edit_text(text, reply_markup=kb)
     except TelegramBadRequest:
         pass
-
-
+ 
+ 
 async def safe_delete(msg: Message):
     try:
         await msg.delete()
     except Exception:
         pass
-
-
+ 
+ 
 async def ask(uid: int, text: str, step: str, kb=BACK_KB):
     steps[uid] = step
     await bot.send_message(uid, text, reply_markup=kb)
-
-
+ 
+ 
 async def admins_alert(text: str):
     for a in {MAIN_ADMIN, *EXTRA_ADMINS, *db_admins}:
         try:
             await bot.send_message(a, text)
         except Exception:
             pass
-
-
+ 
+ 
 def anime_channels() -> list[str]:
     return [x.strip() for x in S("anime_kanal").split("\n") if x.strip()]
-
-
+ 
+ 
 async def is_vip(uid: int) -> bool:
-    return bool(await pool.fetchval("SELECT vip_until > now() FROM users WHERE user_id=$1", uid))
-
-
+    return bool(await pool.fetchval("SELECT vip_until > $2 FROM users WHERE user_id=$1", uid, time.time()))
+ 
+ 
 def protect() -> bool:
     return S("content") == "true"
-
-
+ 
+ 
 def media_of(m: Message):
     if m.photo:
         return "photo", m.photo[-1].file_id
     if m.video:
         return ("video", m.video.file_id) if m.video.duration <= 60 else ("long", None)
     return None, None
-
-
+ 
+ 
 # ----------------------------------------------------- MAJBURIY OBUNA ------
 async def unsubscribed(uid: int):
     rows = await pool.fetch("SELECT * FROM channels ORDER BY id")
@@ -226,8 +287,8 @@ async def unsubscribed(uid: int):
                     title_cache[cid] = "Kanal"
             btns.append((title_cache[cid], link))
     return btns
-
-
+ 
+ 
 async def ensure_sub(uid: int, payload: str = "") -> bool:
     if await is_vip(uid):
         return True
@@ -244,8 +305,8 @@ async def ensure_sub(uid: int, payload: str = "") -> bool:
         uid, "<b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling yoki so'rov yuboring❗️</b>",
         reply_markup=ikb(rows))
     return False
-
-
+ 
+ 
 # --------------------------------------------------------- ANIME KARTA ------
 async def send_card(chat_id: int, aid: int, uid: int, count: bool = True):
     r = await pool.fetchrow("SELECT * FROM animelar WHERE id=$1", aid)
@@ -264,8 +325,8 @@ async def send_card(chat_id: int, aid: int, uid: int, count: bool = True):
         rows.append([b("🗑 Animeni o'chirish", f"da:{aid}")])
     send = bot.send_video if r["rams_type"] == "video" else bot.send_photo
     await send(chat_id, r["rams"], caption=cap, reply_markup=ikb(rows), protect_content=protect())
-
-
+ 
+ 
 async def show_episode(c: CallbackQuery, aid: int, qism: int):
     ep = await pool.fetchrow("SELECT * FROM anime_datas WHERE anime_id=$1 AND qism=$2", aid, qism)
     if not ep:
@@ -289,12 +350,12 @@ async def show_episode(c: CallbackQuery, aid: int, qism: int):
     await safe_delete(c.message)
     await bot.send_video(c.message.chat.id, ep["file_id"], caption=f"<b>{esc(name)}</b>\n\n{qism}-qism",
                          reply_markup=ikb(rows), protect_content=protect())
-
-
+ 
+ 
 def anime_list_kb(rows):
     return ikb([[b(f"{i}. {r['nom']}", f"la:{r['id']}")] for i, r in enumerate(rows, 1)])
-
-
+ 
+ 
 # ---------------------------------------------------------- ADMIN POST ------
 async def send_post(chat_id, r):
     link = f"https://t.me/{BOT_USERNAME}?start={r['id']}"
@@ -306,8 +367,8 @@ async def send_post(chat_id, r):
            f"<b>🎙️ Ovoz berdi:</b> {esc(r['ani_type'])}\n<b>💭 Tili:</b> {esc(r['tili'])}")
     send = bot.send_video if r["rams_type"] == "video" else bot.send_photo
     await send(chat_id, r["rams"], caption=cap, reply_markup=ikb(rows), protect_content=protect())
-
-
+ 
+ 
 async def user_card(uid_t: int):
     r = await pool.fetchrow("SELECT * FROM users WHERE user_id=$1", uid_t)
     if not r:
@@ -320,8 +381,8 @@ async def user_card(uid_t: int):
         [b("❌ VIP dan olish" if vip else "💎 VIP ga qo'shish", f"vip:{uid_t}")],
         [b("➕ Pul qo'shish", f"plus:{uid_t}"), b("➖ Pul ayirish", f"minus:{uid_t}")]])
     return text, kb
-
-
+ 
+ 
 async def broadcast(src_chat: int, mid: int, admin_id: int):
     ids = [r[0] for r in await pool.fetch("SELECT user_id FROM users")]
     ok = fail = 0
@@ -341,8 +402,8 @@ async def broadcast(src_chat: int, mid: int, admin_id: int):
         if (i + 1) % 25 == 0:
             await asyncio.sleep(1)
     await bot.send_message(admin_id, f"<b>✅ Xabar yuborish tugallandi!</b>\n\nYetkazildi: {ok}\nXato: {fail}")
-
-
+ 
+ 
 # --------------------------------------------------------- MIDDLEWARE -------
 class Guard(BaseMiddleware):
     async def __call__(self, handler, event, data):
@@ -365,18 +426,18 @@ class Guard(BaseMiddleware):
                                    "<i>Botda ta'mirlash ishlari olib borilayotgan bo'lishi mumkin!</i>")
             return
         return await handler(event, data)
-
-
+ 
+ 
 router.message.outer_middleware(Guard())
 router.callback_query.outer_middleware(Guard())
-
-
+ 
+ 
 @router.chat_join_request()
 async def on_join_request(e: ChatJoinRequest):
     await pool.execute("INSERT INTO join_requests(channel_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
                        str(e.chat.id), e.from_user.id)
-
-
+ 
+ 
 # ------------------------------------------------------------ /start --------
 def start_text(m: Message) -> str:
     now = datetime.now(TZ)
@@ -385,8 +446,8 @@ def start_text(m: Message) -> str:
                  "%hour%": now.strftime("%H:%M"), "%date%": now.strftime("%d.%m.%Y")}.items():
         t = t.replace(k, v)
     return t
-
-
+ 
+ 
 @router.message(Command("start"))
 async def cmd_start(m: Message, command: CommandObject):
     uid = m.from_user.id
@@ -397,22 +458,22 @@ async def cmd_start(m: Message, command: CommandObject):
             await send_card(m.chat.id, int(arg), uid)
         return
     await m.answer(start_text(m), reply_markup=main_menu(uid))
-
-
+ 
+ 
 @router.message(Command("panel"))
 async def cmd_panel(m: Message):
     if is_admin(m.from_user.id):
         steps.pop(m.from_user.id, None)
         await m.answer("<b>Admin paneliga xush kelibsiz!</b>", reply_markup=ADMIN_PANEL)
-
-
+ 
+ 
 # --------------------------------------------------------- MESSAGES ---------
 @router.message()
 async def on_message(m: Message):
     uid = m.from_user.id
     text = m.text or ""
     admin = is_admin(uid)
-
+ 
     if text == "◀️ Orqaga":
         steps.pop(uid, None)
         await m.answer(start_text(m), reply_markup=main_menu(uid))
@@ -422,15 +483,15 @@ async def on_message(m: Message):
         tmp.pop(uid, None)
         await m.answer("<b>Admin paneliga xush kelibsiz!</b>", reply_markup=ADMIN_PANEL)
         return
-
+ 
     step = steps.get(uid)
     if step and await handle_step(m, uid, step, text):
         return
-
+ 
     if admin and text in ADMIN_TEXTS:
         await admin_button(m, uid, text)
         return
-
+ 
     # --- foydalanuvchi tugmalari
     if text == S("key1"):
         if not await ensure_sub(uid):
@@ -445,20 +506,20 @@ async def on_message(m: Message):
         rows.append([b("📚Barcha animelar", "s:all")])
         await m.answer("<b>🔍Qidiruv tipini tanlang :</b>", reply_markup=ikb(rows))
         return
-
+ 
     if text == S("key2"):
         if not await ensure_sub(uid):
             return
         await vip_menu(m, uid)
         return
-
+ 
     if text == S("key3"):
         if not await ensure_sub(uid):
             return
         pul = await pool.fetchval("SELECT pul FROM users WHERE user_id=$1", uid)
         await m.answer(f"#ID: <code>{uid}</code>\nBalans: {pul} {esc(S('valyuta'))}")
         return
-
+ 
     if text == S("key4"):
         if not await ensure_sub(uid):
             return
@@ -469,7 +530,7 @@ async def on_message(m: Message):
         kb = ikb(chunk([b(p["name"], f"pay:{p['id']}") for p in pays], 2))
         await m.answer("<b>💳 To'lov tizimlarni birini tanlang:</b>", reply_markup=kb)
         return
-
+ 
     if text == S("key5"):
         if not await ensure_sub(uid):
             return
@@ -477,7 +538,7 @@ async def on_message(m: Message):
         await m.answer(t.replace("%user%", "").replace("%botname%", BOT_USERNAME).replace("%id%", str(uid))
                        if t else "<b>🙁 Qo'llanma qo'shilmagan!</b>")
         return
-
+ 
     if text == S("key6"):
         if not await ensure_sub(uid):
             return
@@ -486,35 +547,35 @@ async def on_message(m: Message):
         else:
             await m.answer("<b>🙁 Homiylik qo'shilmagan!</b>")
         return
-
+ 
     # --- standart: nom bo'yicha qidirish
     if text and not text.startswith("/"):
-        rows = await pool.fetch("SELECT id,nom FROM animelar WHERE nom ILIKE $1 ORDER BY id LIMIT 10", f"%{text}%")
+        rows = await pool.fetch("SELECT id,nom FROM animelar WHERE nom LIKE $1 ORDER BY id LIMIT 10", f"%{text}%")
         if rows:
             await m.reply("<b>⬇️ Qidiruv natijalari:</b>", reply_markup=anime_list_kb(rows))
-
-
+ 
+ 
 async def vip_menu(m: Message, uid: int):
     key2 = S("key2")
     narx = int(S("vip") or 0)
     buy_rows = [[b(f"{d} kun - {narx * d // 30} {S('valyuta')}", f"shop:{d}")] for d in (30, 60, 90)]
     until = await pool.fetchval("SELECT vip_until FROM users WHERE user_id=$1", uid)
-    if until and until > datetime.now(TZ):
+    if until and until > time.time():
         await m.answer(f"<b>Siz {esc(key2)} sotib olgansiz!</b>\n\n⏳ Amal qilish muddati "
-                       f"{until.astimezone(TZ).strftime('%d.%m.%Y')} gacha",
+                       f"{datetime.fromtimestamp(until, TZ).strftime('%d.%m.%Y')} gacha",
                        reply_markup=ikb([[b("🗓️ Uzaytirish", "uz")]]))
         return
     await m.answer(f"<b>{esc(key2)}'ga ulanish\n\n{esc(key2)}da qanday imkoniyatlar bor?\n"
                    "• Hech qanday reklamalarsiz botdan foydalanasiz\n"
                    "• Majburiy obunalik so'ralmaydi\n• Janr, so'nggi va TOP qidiruvlar ochiladi</b>",
                    reply_markup=ikb(buy_rows))
-
-
+ 
+ 
 # ------------------------------------------------------ ADMIN TUGMALAR ------
 async def admin_button(m: Message, uid: int, text: str):
     if text == "📊 Statistika":
         total = await pool.fetchval("SELECT count(*) FROM users")
-        vips = await pool.fetchval("SELECT count(*) FROM users WHERE vip_until > now()")
+        vips = await pool.fetchval("SELECT count(*) FROM users WHERE vip_until > $1", time.time())
         animes = await pool.fetchval("SELECT count(*) FROM animelar")
         await m.answer(f"👥 <b>Foydalanuvchilar:</b> {total} ta\n💎 <b>VIP:</b> {vips} ta\n🎬 <b>Animelar:</b> {animes} ta")
     elif text == "✉ Xabar Yuborish":
@@ -552,27 +613,27 @@ async def admin_button(m: Message, uid: int, text: str):
     elif text == "💳 Hamyonlar":
         t, kb = await pays_menu()
         await m.answer(t, reply_markup=kb)
-
-
+ 
+ 
 def basic_settings():
     t = (f"<b>Hozirgi birlamchi sozlamalar:</b>\n\n<i>1. Valyuta - {esc(S('valyuta'))}\n"
          f"2. VIP narxi - {esc(S('vip'))} {esc(S('valyuta'))}\n3. Studia nomi - {esc(S('studio_name'))}</i>")
     kb = ikb([[b("1", "set:valyuta"), b("2", "set:vip"), b("3", "set:studio_name")],
               [b("🔒 Kontent cheklash" if not protect() else "🔓 Kontent ulashish", "content")]])
     return t, kb
-
-
+ 
+ 
 async def pays_menu():
     pays = await pool.fetch("SELECT id,name FROM payments ORDER BY id")
     rows = [[b(f"{p['name']} - ni o'chirish", f"paydel:{p['id']}")] for p in pays]
     rows.append([b("➕ Yangi to'lov tizimi qo'shish", "payadd")])
     return "<b>Quyidagilardan birini tanlang:</b>", ikb(rows)
-
-
+ 
+ 
 # ------------------------------------------------------------ STEPS ---------
 async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
     t = tmp.setdefault(uid, {})
-
+ 
     # ---- foydalanuvchi bosqichlari
     if step == "s_code":
         if text.isdigit():
@@ -586,18 +647,18 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         if not await is_vip(uid):
             steps.pop(uid, None)
             return False
-        rows = await pool.fetch("SELECT id,nom FROM animelar WHERE janri ILIKE $1 LIMIT 10", f"%{text}%")
+        rows = await pool.fetch("SELECT id,nom FROM animelar WHERE janri LIKE $1 LIMIT 10", f"%{text}%")
         if not rows:
             await m.answer(f"<b>[ {esc(text)} ] janriga tegishli anime topilmadi😔</b>\n\n• Boshqa janrni yuboring")
         else:
             steps.pop(uid, None)
             await m.reply("<b>⬇️ Qidiruv natijalari:</b>", reply_markup=anime_list_kb(rows))
         return True
-
+ 
     if not is_admin(uid):
         steps.pop(uid, None)
         return False
-
+ 
     # ---- admin bosqichlari
     if step == "send":
         steps.pop(uid, None)
@@ -606,7 +667,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         bg_tasks.add(task)
         task.add_done_callback(bg_tasks.discard)
         return True
-
+ 
     if step == "post":
         if not text.isdigit() or not await pool.fetchval("SELECT 1 FROM animelar WHERE id=$1", int(text)):
             await m.answer("<b>❌ Anime topilmadi, kodni qayta kiriting:</b>")
@@ -616,7 +677,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         rows.append([b("📡 BARCHA kanallarga yuborish", f"snd:all:{text}")])
         await m.answer("📬 Qaysi kanalga yuborilsin?", reply_markup=ikb(rows))
         return True
-
+ 
     if step == "uid":
         if not text.isdigit():
             await m.answer("<b>Faqat raqam yuboring:</b>")
@@ -628,7 +689,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         steps.pop(uid, None)
         await m.answer(txt, reply_markup=kb)
         return True
-
+ 
     if step.startswith(("plus:", "minus:")):
         sign, target = step.split(":")
         try:
@@ -646,7 +707,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         except Exception:
             pass
         return True
-
+ 
     if step == "addch_id":
         raw = text.replace("-100", "")
         if not raw.isdigit():
@@ -665,7 +726,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         await m.answer("<b>⚠️Ushbu kanal zayafka kanal sifatida qo'shilsinmi?</b>", reply_markup=ikb([
             [b("✅Ha", "addch:request"), b("❌Yo'q", "addch:lock")], [b("🚫Bekor qilish", "cancel")]]))
         return True
-
+ 
     if step == "ak_add":
         if not text.startswith("@"):
             await m.answer("<b>❗️To'g'ri formatda yuboring.</b> Namuna: <code>@kanalim</code>")
@@ -679,7 +740,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         steps.pop(uid, None)
         await m.answer(f"✅ <b>Kanal qo'shildi:</b> <code>{esc(text)}</code>", reply_markup=ADMIN_PANEL)
         return True
-
+ 
     if step.startswith("social:"):
         net = step.split(":")[1]
         host = ("instagram.com",) if net == "insta" else ("youtube.com", "youtu.be")
@@ -692,7 +753,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         steps.pop(uid, None)
         await m.answer("✅ Havola saqlandi.", reply_markup=ADMIN_PANEL)
         return True
-
+ 
     if step in ("adm_add", "adm_rem") and uid == MAIN_ADMIN:
         if not text.isdigit():
             await m.answer("<b>Faqat raqam yuboring:</b>")
@@ -708,7 +769,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
             await m.answer(f"<code>{target}</code> <b>adminlar ro'yxatidan olib tashlandi!</b>", reply_markup=ADMIN_PANEL)
         steps.pop(uid, None)
         return True
-
+ 
     if step.startswith("set:"):
         key = step.split(":")[1]
         if not text:
@@ -720,7 +781,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         steps.pop(uid, None)
         await m.answer("<b>✅ Saqlandi.</b>", reply_markup=ADMIN_PANEL)
         return True
-
+ 
     if step.startswith("key:"):
         key = "key" + step.split(":")[1]
         if text:
@@ -729,7 +790,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
             await m.answer(f"<b>Qabul qilindi!</b>\n\n<i>Tugma nomi</i> <b>{esc(text)}</b> <i>ga o'zgartirildi.</i>",
                            reply_markup=ADMIN_PANEL)
         return True
-
+ 
     if step == "pay_name":
         t["pay_name"] = text
         steps[uid] = "pay_wallet"
@@ -746,7 +807,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         steps.pop(uid, None)
         await m.answer("<b>Yangi to'lov tizimi qo'shildi!</b>", reply_markup=ADMIN_PANEL)
         return True
-
+ 
     # ---- anime qo'shish
     if step.startswith("add:") and step != "add:pic":
         if not text:
@@ -763,7 +824,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
             steps[uid] = "add:pic"
             await m.answer("<b>🏞 Rasmini yoki 60 soniyadan oshmagan video yuboring:</b>")
         return True
-
+ 
     if step == "add:pic":
         kind, fid = media_of(m)
         if kind == "long":
@@ -780,7 +841,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         tmp.pop(uid, None)
         await m.answer(f"<b>✅ Anime qo'shildi!</b>\n\n<b>Anime kodi:</b> <code>{code}</code>", reply_markup=ADMIN_PANEL)
         return True
-
+ 
     # ---- qism qo'shish
     if step == "ep_code":
         if text.isdigit() and await pool.fetchval("SELECT 1 FROM animelar WHERE id=$1", int(text)):
@@ -799,7 +860,7 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
         await m.answer(f"<b>✅ {aid} raqamli animega {n}-qism yuklandi!</b>\n\n"
                        "<i>Yana yuklash uchun keyingi qismni yuborsangiz bo'ldi</i>")
         return True
-
+ 
     # ---- tahrirlash
     if step.startswith("ecode:"):
         kind = step.split(":")[1]
@@ -864,20 +925,20 @@ async def handle_step(m: Message, uid: int, step: str, text: str) -> bool:
             try:
                 await pool.execute("UPDATE anime_datas SET qism=$1 WHERE anime_id=$2 AND qism=$3",
                                    int(text), int(aid), int(qism))
-            except asyncpg.UniqueViolationError:
+            except sqlite3.IntegrityError:
                 await m.answer("<b>❗Bu raqamli qism allaqachon mavjud.</b>")
                 return True
         steps.pop(uid, None)
         await m.answer("<b>✅ Saqlandi.</b>", reply_markup=ADMIN_PANEL)
         return True
-
+ 
     return False
-
-
+ 
+ 
 # --------------------------------------------------------- CALLBACKS --------
 PUBLIC = {"chk", "s", "la", "ep", "pg", "close", "null", "uz", "shop", "pay", "payback"}
-
-
+ 
+ 
 @router.callback_query()
 async def on_callback(c: CallbackQuery):
     uid = c.from_user.id
@@ -897,18 +958,18 @@ async def on_callback(c: CallbackQuery):
         await c.answer()
     except Exception:
         pass
-
-
+ 
+ 
 async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Message):
     v = esc(S("valyuta"))
-
+ 
     # ---------- umumiy
     if act == "null":
         return False
     if act == "close":
         await safe_delete(msg)
         return False
-
+ 
     if act == "chk":
         await safe_delete(msg)
         payload = p[1] if len(p) > 1 else ""
@@ -918,7 +979,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
             else:
                 await bot.send_message(uid, S("start"), reply_markup=main_menu(uid))
         return False
-
+ 
     if act == "s":
         kind = p[1]
         if kind == "name":
@@ -949,16 +1010,16 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
             await bot.send_document(uid, BufferedInputFile(txt.encode(), "animelar.txt"),
                                     caption=f"<b>📝{esc(BOT_USERNAME)} botida {len(rows)} ta anime mavjud</b>")
         return False
-
+ 
     if act == "la":
         await safe_delete(msg)
         await send_card(uid, int(p[1]), uid, count=False)
         return False
-
+ 
     if act == "ep":
         await show_episode(c, int(p[1]), int(p[2]))
         return False
-
+ 
     if act == "pg":
         aid, page = int(p[1]), int(p[2])
         if page < 0:
@@ -972,21 +1033,22 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
             return True
         await show_episode(c, aid, first)
         return False
-
+ 
     if act == "uz":
         narx = int(S("vip") or 0)
         await edit(msg, "<b>❗ Obunani necha kunga uzaytirmoqchisiz?</b>", ikb(
             [[b(f"{d} kun - {narx * d // 30} {S('valyuta')}", f"shop:{d}")] for d in (30, 60, 90)]))
         return False
-
+ 
     if act == "shop":
         days = int(p[1])
         price = int(S("vip") or 0) * days // 30
         was_vip = await is_vip(uid)
+        now_ts = time.time()
         res = await pool.fetchval(
             "UPDATE users SET pul = pul - $1, "
-            "vip_until = GREATEST(COALESCE(vip_until, now()), now()) + make_interval(days => $2) "
-            "WHERE user_id=$3 AND pul >= $1 RETURNING 1", price, days, uid)
+            "vip_until = MAX(COALESCE(vip_until, $3), $3) + $2 "
+            "WHERE user_id=$4 AND pul >= $1 RETURNING 1", price, days * 86400, now_ts, uid)
         if not res:
             await c.answer("Hisobingizda yetarli mablag' mavjud emas!", show_alert=True)
             return True
@@ -995,7 +1057,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
         if not was_vip:
             await admins_alert(f"<a href='tg://user?id={uid}'>Foydalanuvchi</a> {days} kunlik obuna sotib oldi!")
         return False
-
+ 
     if act == "pay":
         r = await pool.fetchrow("SELECT * FROM payments WHERE id=$1", int(p[1]))
         if r:
@@ -1009,13 +1071,13 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
         await edit(msg, "<b>💳 To'lov tizimlarni birini tanlang:</b>",
                    ikb(chunk([b(x["name"], f"pay:{x['id']}") for x in pays], 2)))
         return False
-
+ 
     # ---------- admin
     if act == "cancel":
         await safe_delete(msg)
         await bot.send_message(uid, "<b>✅Bekor qilindi !</b>", reply_markup=ADMIN_PANEL)
         return False
-
+ 
     if act == "an":
         await safe_delete(msg)
         if p[1] == "add":
@@ -1044,7 +1106,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
         await ask(uid, "<b>Yangi qiymatini kiriting:</b>" if p[1] == "qism" else "<b>Yangi videoni yuboring:</b>",
                   f"eedit:{p[1]}:{p[2]}:{p[3]}")
         return False
-
+ 
     if act == "da":
         await edit(msg, "<b>❗Animeni va uning barcha qismlarini o'chirishga ishonchingiz komilmi?</b>", ikb([
             [b("✅ Tasdiqlash", f"dac:{p[1]}")], [b("❌ Bekor qilish", "close")]]))
@@ -1064,7 +1126,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
         await safe_delete(msg)
         await bot.send_message(uid, f"<b>✅ {p[2]}-qism o'chirildi!</b>")
         return False
-
+ 
     if act == "snd":
         r = await pool.fetchrow("SELECT * FROM animelar WHERE id=$1", int(p[2]))
         if not r:
@@ -1086,7 +1148,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
         await bot.send_message(uid, txt, reply_markup=ADMIN_PANEL)
         await send_post(uid, r)
         return False
-
+ 
     # --- foydalanuvchini boshqarish
     if act in ("ban", "vip", "plus", "minus", "u"):
         target = int(p[1])
@@ -1099,7 +1161,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
             if await is_vip(target):
                 await pool.execute("UPDATE users SET vip_until=NULL WHERE user_id=$1", target)
             else:
-                await pool.execute("UPDATE users SET vip_until = now() + interval '30 days' WHERE user_id=$1", target)
+                await pool.execute("UPDATE users SET vip_until=$1 WHERE user_id=$2", time.time() + 30 * 86400, target)
         elif act in ("plus", "minus"):
             await safe_delete(msg)
             word = "qo'shmoqchisiz" if act == "plus" else "ayirmoqchisiz"
@@ -1110,7 +1172,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
         if txt:
             await edit(msg, txt, kb)
         return False
-
+ 
     # --- kanallar
     if act == "chm":
         await edit(msg, "<b>🔐Majburiy obunalarni sozlash bo'limidasiz:</b>", ikb([
@@ -1155,7 +1217,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
         kb_rows.append([b("🔙Ortga", "chm")])
         await edit(msg, txt, ikb(kb_rows))
         return True if act == "chdel" else False
-
+ 
     if act == "qk":
         await edit(msg, "<b>Qo'shimcha kanallar sozlash bo'limidasiz:</b>", ikb([
             [b("🎥 Anime kanal", "ak")], [b("🎁 Ijtimoiy tarmoqlar", "soc")], [b("◀️ Orqaga", "chback")]]))
@@ -1189,7 +1251,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
             await set_setting("anime_kanal", "\n".join(lst))
             await edit(msg, f"✅ <b>{esc(removed)}</b> kanali o'chirildi.")
         return False
-
+ 
     if act == "soc":
         await edit(msg, "🌐 O'zingizga kerakli 🎁 ijtimoiy tarmoqni tanlang!", ikb([
             [b("📸 Instagram", "socm:insta")], [b("🎥 YouTube", "socm:yt")]]))
@@ -1216,7 +1278,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
         else:
             await edit(msg, f"🌟 <b>Havola:</b>\n\n{esc(S(key))}" if S(key) else "🌟 <b>Havola mavjud emas</b>")
         return False
-
+ 
     # --- adminlar
     if act == "admlist":
         allad = [MAIN_ADMIN, *sorted(EXTRA_ADMINS | db_admins)]
@@ -1226,7 +1288,7 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
         await safe_delete(msg)
         await ask(uid, "<b>Kerakli foydalanuvchi ID raqamini yuboring:</b>", "adm_add" if act == "admadd" else "adm_rem")
         return False
-
+ 
     # --- bot holati / sozlamalar / matnlar / tugmalar / hamyon
     if act == "bot":
         await set_setting("holat", "off" if S("holat") != "off" else "on")
@@ -1272,15 +1334,15 @@ async def route_callback(c: CallbackQuery, uid: int, act: str, p: list, msg: Mes
         txt, kb = await pays_menu()
         await edit(msg, "<b>To'lov tizimi o'chirildi!</b>\n\n" + txt, kb)
         return False
-
+ 
     return False
-
-
+ 
+ 
 # -------------------------------------------------------------- WEB ---------
 async def health(_: web.Request):
     return web.Response(text="OK")
-
-
+ 
+ 
 async def start_web():
     app = web.Application()
     app.router.add_get("/", health)
@@ -1289,20 +1351,19 @@ async def start_web():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     log.info("Web server %s-portda ishga tushdi", PORT)
-
-
+ 
+ 
 # -------------------------------------------------------------- MAIN --------
 async def main():
     global pool, BOT_USERNAME
     await start_web()  # avval port ochiladi, Render tezda "live" deb topadi
-
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    async with pool.acquire() as con:
-        await con.execute(SCHEMA)
+ 
+    pool = DB(DB_PATH)
+    pool.script(SCHEMA)
     for r in await pool.fetch("SELECT key,value FROM settings"):
         settings[r["key"]] = r["value"]
     db_admins.update(r[0] for r in await pool.fetch("SELECT user_id FROM admins"))
-
+ 
     BOT_USERNAME = (await bot.get_me()).username
     await bot.delete_webhook(drop_pending_updates=False)
     log.info("Bot @%s polling rejimida ishga tushdi", BOT_USERNAME)
@@ -1310,8 +1371,9 @@ async def main():
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
-        await pool.close()
-
-
+        pool.close()
+ 
+ 
 if __name__ == "__main__":
     asyncio.run(main())
+ 
