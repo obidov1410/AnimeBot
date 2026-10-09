@@ -74,10 +74,9 @@ def main_menu():
 
 def search_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔤 Nom bo'yicha", callback_data="search_name")],
-        [InlineKeyboardButton(text="🔢 Kod bo'yicha", callback_data="search")],
-        [InlineKeyboardButton(text="📚 Barcha animelar", callback_data="list")],
-        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
+        [InlineKeyboardButton(text="🔢 Kod", callback_data="search") , InlineKeyboardButton(text="🔠 Nom", callback_data="search_name")],
+        [InlineKeyboardButton(text="📚 Ro'yxat", callback_data="list")],
+        [InlineKeyboardButton(text="🛑 Orqaga", callback_data="home")],
     ])
 
 
@@ -106,14 +105,48 @@ def admin_menu():
     ])
 
 
+def episode_keyboard(code: str, episodes: dict):
+    """Qism raqamlarini ixcham 5 ustunli jadvalda chiqaradi."""
+    rows, row = [], []
+    def sort_key(value):
+        return (0, int(value)) if str(value).isdigit() else (1, str(value))
+    for number in sorted(episodes, key=sort_key):
+        row.append(InlineKeyboardButton(text=str(number), callback_data=f"episode:{code}:{number}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="🛑 Orqaga", callback_data="search_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def anime_caption(code: str, anime: dict) -> str:
+    description = (anime.get("description") or "").strip()
+    base = f"🎬 <b>{anime['name']}</b>\n\n🔢 Anime kodi: <code>{code}</code>\n🎞 Qismlar: {len(anime.get('episodes', {}))}"
+    if description:
+        base += "\n\n" + description
+    return base[:1024]
+
+
+async def send_anime_card(chat_id: int, code: str, anime: dict):
+    caption = anime_caption(code, anime)
+    markup = episode_keyboard(code, anime.get("episodes", {}))
+    poster = anime.get("poster_file_id")
+    if poster:
+        await bot.send_photo(chat_id, poster, caption=caption, reply_markup=markup)
+    else:
+        await bot.send_message(chat_id, caption, reply_markup=markup)
+
+
 class Form(StatesGroup):
     search_code = State()
     search_name = State()
     anime_code = State()
     anime_name = State()
+    anime_info = State()
     episode_code = State()
-    episode_number = State()
-    episode_message = State()
+    episode_batch = State()
     delete_code = State()
     delete_episode_code = State()
     delete_episode_number = State()
@@ -128,25 +161,53 @@ class Form(StatesGroup):
     start_text = State()
 
 
+def parse_channel_entry(entry):
+    """Eski format (@username yoki -100... ID) va yangi ID|invite formatini o'qiydi."""
+    raw = str(entry).strip()
+    if "|" in raw:
+        chat_ref, invite_url = (part.strip() for part in raw.split("|", 1))
+    else:
+        chat_ref, invite_url = raw, ""
+    if chat_ref.lstrip("-").isdigit():
+        chat_ref = int(chat_ref)
+    elif chat_ref.startswith("https://t.me/"):
+        # Kanal username URL ko'rinishida berilgan bo'lsa, username'ga aylantiramiz.
+        tail = chat_ref.removeprefix("https://t.me/").strip("/")
+        chat_ref = "@" + tail if tail and not tail.startswith("+") else chat_ref
+    if not invite_url and isinstance(chat_ref, str) and chat_ref.startswith("@"):
+        invite_url = "https://t.me/" + chat_ref[1:]
+    return chat_ref, invite_url, raw
+
+
 async def check_subscription(user_id: int) -> bool:
-    channels = load_data()["channels"]
-    for channel in channels:
+    channels = load_data().get("channels", [])
+    for entry in channels:
+        chat_ref, _invite_url, raw = parse_channel_entry(entry)
         try:
-            member = await bot.get_chat_member(channel, user_id)
-            if member.status not in ("creator", "administrator", "member"):
+            member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
+            # Restricted a'zolar ham is_member=True bo'lsa obunachi hisoblanadi.
+            status = str(member.status)
+            status = status.split(".")[-1].lower()
+            is_member = status in ("creator", "administrator", "member")
+            if status == "restricted":
+                is_member = bool(getattr(member, "is_member", False))
+            if not is_member:
+                logging.info("Subscription missing: user=%s channel=%s status=%s", user_id, raw, status)
                 return False
-        except Exception:
-            # Kanal ID/username noto'g'ri bo'lsa, xavfsizlik uchun obunani tasdiqlamaymiz.
+        except Exception as exc:
+            logging.exception("get_chat_member failed for channel=%s: %s", raw, exc)
             return False
     return True
 
 
 def subscription_keyboard():
     rows = []
-    for channel in load_data()["channels"]:
-        url = f"https://t.me/{channel.lstrip('@')}" if str(channel).startswith("@") else None
-        if url:
-            rows.append([InlineKeyboardButton(text=f"📢 {channel}", url=url)])
+    for entry in load_data().get("channels", []):
+        chat_ref, invite_url, raw = parse_channel_entry(entry)
+        # Private kanal uchun taklif havolasi shart; uni admin ID|https://t.me/+... ko'rinishida beradi.
+        if invite_url:
+            label = str(chat_ref) if str(chat_ref).startswith("@") else "Maxfiy kanal"
+            rows.append([InlineKeyboardButton(text=f"📢 {label}", url=invite_url)])
     rows.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -179,24 +240,31 @@ async def admin_command(message: Message):
 @dp.callback_query(F.data == "home")
 async def home(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await send_start(call.message)
+    data = load_data()
+    try:
+        await call.message.edit_text(data["start_text"], reply_markup=main_menu())
+    except Exception:
+        await call.message.answer(data["start_text"], reply_markup=main_menu())
     await call.answer()
 
 
 @dp.callback_query(F.data == "search_menu")
 async def search_menu_open(call: CallbackQuery):
-    await call.message.answer("🔎 <b>Anime izlash</b>\nQidirish usulini tanlang:", reply_markup=search_menu())
+    try:
+        await call.message.edit_text("🔎 <b>Anime izlash</b>\n\nKerakli usulni tanlang:", reply_markup=search_menu())
+    except Exception:
+        await call.message.answer("🔎 <b>Anime izlash</b>\n\nKerakli usulni tanlang:", reply_markup=search_menu())
     await call.answer()
 
 
 @dp.callback_query(F.data == "guide")
 async def guide(call: CallbackQuery):
-    await call.message.answer(
-        "📖 <b>Qo'llanma</b>\n\n1️⃣ «Anime izlash» tugmasini bosing.\n"
-        "2️⃣ Nom bo'yicha, kod bo'yicha yoki barcha animelar ro'yxatidan tanlang.\n"
-        "3️⃣ Anime ichidan kerakli qismni bosing.\n\n⬅️ Orqaga qaytish uchun tugmalardan foydalaning.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
-    )
+    text = "📖 <b>Qo'llanma</b>\n\n1️⃣ Anime izlashni bosing.\n2️⃣ 🔢 Kod, 🔠 Nom yoki 📚 Ro'yxatni tanlang.\n3️⃣ Anime sahifasidan kerakli qism raqamini bosing.\n\n🛑 Orqaga tugmasi oldingi menyuga qaytaradi."
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛑 Orqaga", callback_data="home")]])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
     await call.answer()
 
 
@@ -239,15 +307,7 @@ async def search_code(message: Message, state: FSMContext):
     anime = data["animes"].get(code)
     if not anime:
         return await message.answer("❌ Bu kod bo'yicha anime topilmadi.")
-    episodes = anime.get("episodes", {})
-    text = f"🎬 <b>{anime['name']}</b>\n🔢 Kod: <code>{code}</code>\n📺 Qismlar: {len(episodes)}"
-    rows = []
-    for number in sorted(episodes, key=lambda x: int(x) if str(x).isdigit() else 0):
-        rows.append([InlineKeyboardButton(
-            text=f"▶️ {number}-qism", callback_data=f"episode:{code}:{number}"
-        )])
-    rows.append([InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="home")])
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await send_anime_card(message.chat.id, code, anime)
 
 
 @dp.callback_query(F.data.startswith("episode:"))
@@ -291,14 +351,14 @@ async def show_anime(call: CallbackQuery):
     data = load_data()
     if code not in data["animes"]:
         return await call.answer("Anime topilmadi", show_alert=True)
-    anime = data["animes"][code]
-    rows = [[InlineKeyboardButton(text=f"▶️ {n}-qism", callback_data=f"episode:{code}:{n}")]
-            for n in anime.get("episodes", {})]
-    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="list")])
-    await call.message.answer(
-        f"🎬 <b>{anime['name']}</b>\n🔢 Kod: <code>{code}</code>\n📺 Qismlar: {len(rows)}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-    )
+    try:
+        await call.message.edit_text("🎬 <b>Anime ochildi.</b>")
+    except Exception:
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await send_anime_card(call.from_user.id, code, data["animes"][code])
     await call.answer()
 
 
@@ -337,17 +397,50 @@ async def anime_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
     if not name:
         return await message.answer("Anime nomini matn ko'rinishida yuboring:")
+    await state.update_data(new_name=name)
+    await state.set_state(Form.anime_info)
+    await message.answer(
+        "🖼 Endi anime rasmi va ma'lumotini yuboring.\n"
+        "• Rasmni caption bilan yuboring; yoki\n"
+        "• Faqat tavsif matnini yuboring.\n"
+        "Rasm/tavsif kerak bo'lmasa /skip yuboring."
+    )
+
+
+@dp.message(Form.anime_info)
+async def anime_info(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     saved = await state.get_data()
     data = load_data()
-    data["animes"][saved["new_code"]] = {"name": name, "episodes": {}}
+    code, name = saved["new_code"], saved["new_name"]
+    poster = None
+    description = ""
+    if message.text and message.text.strip() == "/skip":
+        pass
+    elif message.photo:
+        poster = message.photo[-1].file_id
+        description = (message.caption or "").strip()
+    elif message.text:
+        description = message.text.strip()
+    else:
+        return await message.answer("Rasm yoki matn yuboring, yoki /skip bosing.")
+    data["animes"][code] = {"name": name, "description": description, "poster_file_id": poster, "episodes": {}}
     save_data(data)
-    await state.clear()
-    await message.answer(f"✅ <b>{name}</b> qo'shildi. Endi «Qism qo'shish» tugmasi orqali qismlarini kiriting.", reply_markup=admin_menu())
-
+    await state.update_data(batch_code=code, batch_count=0)
+    await state.set_state(Form.episode_batch)
+    prompt = await message.answer(
+        f"✅ <b>{name}</b> (kod <code>{code}</code>) yaratildi.\n\n"
+        "Endi barcha qismlarni kanal postlaridan <b>1, 2, 3...</b> tartibida ketma-ket forward qiling. "
+        "Har bir forward avtomatik keyingi qism raqamiga biriktiriladi.\n\n"
+        "Tugatgach /done yuboring. Bekor qilish: /cancel"
+    )
+    await state.update_data(progress_message_id=prompt.message_id)
 
 @dp.callback_query(F.data == "add_episode")
 async def add_episode(call: CallbackQuery, state: FSMContext):
-    await ask(call, state, Form.episode_code, "Anime kodini yuboring:")
+    await ask(call, state, Form.episode_code, "Qismlar qo'shiladigan anime kodini yuboring:")
 
 
 @dp.message(Form.episode_code)
@@ -359,42 +452,30 @@ async def episode_code(message: Message, state: FSMContext):
     data = load_data()
     if code not in data["animes"]:
         return await message.answer("❌ Bunday kodli anime yo'q. Qayta yuboring:")
-    await state.update_data(episode_code=code)
-    await state.set_state(Form.episode_number)
-    await message.answer("Qism raqamini yuboring (masalan, 1):")
-
-
-@dp.message(Form.episode_number)
-async def episode_number(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
-    number = (message.text or "").strip()
-    if not number.isdigit() or int(number) < 1:
-        return await message.answer("Qism raqami musbat son bo'lishi kerak:")
-    saved = await state.get_data()
-    await state.update_data(episode_number=number)
-    await state.set_state(Form.episode_message)
-    await message.answer(
-        f"Endi {saved['episode_code']} kodi, {number}-qism uchun video/xabarni "
-        "saqlash kanalidan shu yerga forward qiling."
+    await state.update_data(batch_code=code, batch_count=0)
+    await state.set_state(Form.episode_batch)
+    prompt = await message.answer(
+        f"🎬 <b>{data['animes'][code]['name']}</b> uchun barcha yangi qismlarni ketma-ket forward qiling.\n"
+        "Qismlar mavjud raqamlardan keyin avtomatik raqamlanadi.\n"
+        "Tugatgach /done yuboring. Bekor qilish: /cancel"
     )
+    await state.update_data(progress_message_id=prompt.message_id)
 
 
-@dp.message(Form.episode_message)
-async def episode_message(message: Message, state: FSMContext):
+@dp.message(Form.episode_batch)
+async def episode_batch_message(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await state.clear()
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
-    if not is_admin(message.from_user.id):
+    if (message.text or "").strip().lower() in ("/done", "done", "tayyor"):
+        saved = await state.get_data()
+        count = int(saved.get("batch_count", 0))
+        code = saved.get("batch_code")
         await state.clear()
-        return
-    if not message.forward_from_chat and not message.forward_origin:
-        return await message.answer("❌ Kanal xabarini forward qiling yoki kanal postini botga yuboring.")
-    saved = await state.get_data()
+        return await message.answer(f"✅ Yakunlandi. {count} ta qism saqlandi.", reply_markup=admin_menu())
+    origin = message.forward_origin
     source_chat = None
     source_message = None
-    origin = message.forward_origin
     if origin and getattr(origin, "chat", None):
         source_chat = origin.chat.id
         source_message = getattr(origin, "message_id", None)
@@ -402,16 +483,33 @@ async def episode_message(message: Message, state: FSMContext):
         source_chat = message.forward_from_chat.id
         source_message = message.forward_from_message_id
     if source_chat is None or source_message is None:
-        return await message.answer("❌ Manba kanal/xabar ID'sini aniqlab bo'lmadi. Kanal postini forward qiling.")
+        return await message.answer("❌ Kanal postini forward qiling. Tugatish uchun /done, bekor qilish uchun /cancel.")
+    saved = await state.get_data()
+    code = saved.get("batch_code")
     data = load_data()
-    code, number = saved["episode_code"], saved["episode_number"]
-    data["animes"][code]["episodes"][number] = {
-        "chat_id": source_chat, "message_id": source_message
-    }
+    if code not in data["animes"]:
+        await state.clear()
+        return await message.answer("❌ Anime topilmadi, amal bekor qilindi.", reply_markup=admin_menu())
+    episodes = data["animes"][code].setdefault("episodes", {})
+    numeric = [int(n) for n in episodes if str(n).isdigit()]
+    number = max(numeric, default=0) + 1
+    episodes[str(number)] = {"chat_id": source_chat, "message_id": source_message}
     save_data(data)
-    await state.clear()
-    await message.answer(f"✅ {data['animes'][code]['name']} — {number}-qism saqlandi.", reply_markup=admin_menu())
-
+    count = int(saved.get("batch_count", 0)) + 1
+    await state.update_data(batch_count=count)
+    progress_id = saved.get("progress_message_id")
+    if progress_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=progress_id,
+                text=(f"🎬 <b>{data['animes'][code]['name']}</b>\n"
+                      f"✅ {count} ta qism saqlandi. Oxirgisi: <b>{number}-qism</b>.\n\n"
+                      "Keyingi qismlarni ketma-ket forward qilishda davom eting.\n"
+                      "Tugatish: /done · Bekor qilish: /cancel")
+            )
+        except Exception:
+            pass
 
 @dp.callback_query(F.data == "del_anime")
 async def del_anime(call: CallbackQuery, state: FSMContext):
@@ -583,7 +681,11 @@ async def del_admin_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "add_channel")
 async def add_channel_start(call: CallbackQuery, state: FSMContext):
-    await ask(call, state, Form.channel_add, "Kanal @username yoki -100... ID raqamini yuboring. Bot kanalda admin bo'lishi kerak:")
+    await ask(call, state, Form.channel_add,
+        "Kanalni yuboring. Ochiq kanal: @username\n"
+        "Maxfiy kanal: -100...ID | https://t.me/+taklif_havolasi\n"
+        "Masalan: -1001234567890 | https://t.me/+AbCdEfGh\n"
+        "Bot kanal ichida administrator bo'lishi kerak. Maxfiy kanal uchun ID va taklif havolasi ikkalasi ham kerak:")
 
 
 @dp.message(Form.channel_add)
@@ -593,11 +695,22 @@ async def add_channel_save(message: Message, state: FSMContext):
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     channel = (message.text or "").strip()
     data = load_data()
-    if channel and channel not in data["channels"]:
-        data["channels"].append(channel)
+    if not channel:
+        return await message.answer("❌ Kanal ma'lumoti bo'sh. Qayta yuboring yoki /cancel bosing.")
+    chat_ref, invite_url, raw = parse_channel_entry(channel)
+    if isinstance(chat_ref, str) and chat_ref.startswith("https://t.me/+"):
+        return await message.answer("❌ Maxfiy kanal uchun ID ham kerak: -100...ID | https://t.me/+...")
+    if not (str(chat_ref).startswith("@") or (isinstance(chat_ref, int) and str(chat_ref).startswith("-100"))):
+        return await message.answer("❌ Kanal formati noto'g'ri. @username yoki -100...ID | invite URL yuboring.")
+    if isinstance(chat_ref, int) and not invite_url:
+        return await message.answer("⚠️ Kanal ID qabul qilindi, lekin tugma chiqishi uchun taklif havolasi ham kerak.\n"
+            "Quyidagi formatda yuboring: -100...ID | https://t.me/+taklif_havolasi\n"
+            "Yoki /cancel qilib, to'g'ri formatda qayta boshlang.")
+    if raw not in data["channels"]:
+        data["channels"].append(raw)
         save_data(data)
     await state.clear()
-    await message.answer("✅ Kanal ro'yxatga qo'shildi.", reply_markup=admin_menu())
+    await message.answer("✅ Kanal ro'yxatga qo'shildi. Tugma va obunani tekshirish uchun bot o'sha kanalda administrator bo'lishi kerak.", reply_markup=admin_menu())
 
 
 @dp.callback_query(F.data == "del_channel")
@@ -612,11 +725,22 @@ async def del_channel_save(message: Message, state: FSMContext):
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     channel = (message.text or "").strip()
     data = load_data()
-    if channel in data["channels"]:
-        data["channels"].remove(channel)
+    # Kanalni ID, username yoki ID|invite formatida o'chirish mumkin.
+    target_ref, _target_invite, target_raw = parse_channel_entry(channel)
+    matches = []
+    for entry in data.get("channels", []):
+        ref, _invite, raw = parse_channel_entry(entry)
+        if raw == target_raw or str(ref) == str(target_ref):
+            matches.append(entry)
+    for entry in matches:
+        data["channels"].remove(entry)
+    if matches:
         save_data(data)
     await state.clear()
-    await message.answer("✅ Kanal ro'yxati yangilandi.", reply_markup=admin_menu())
+    if matches:
+        await message.answer("✅ Kanal ro'yxatdan o'chirildi.", reply_markup=admin_menu())
+    else:
+        await message.answer("❌ Bunday kanal topilmadi. Kanal ID/username'ni tekshiring.", reply_markup=admin_menu())
 
 
 @dp.callback_query(F.data == "start_text")
@@ -680,12 +804,7 @@ async def fallback(message: Message):
         code = message.text.strip()
         if code in data["animes"]:
             anime = data["animes"][code]
-            rows = [[InlineKeyboardButton(text=f"▶️ {n}-qism", callback_data=f"episode:{code}:{n}")]
-                    for n in anime.get("episodes", {})]
-            await message.answer(
-                f"🎬 <b>{anime['name']}</b>\n🔢 Kod: <code>{code}</code>\n📺 Qismlar: {len(rows)}",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-            )
+            await send_anime_card(message.chat.id, code, anime)
         else:
             await message.answer("❌ Kod topilmadi. Qayta tekshiring.")
     elif message.text:
