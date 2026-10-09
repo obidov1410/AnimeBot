@@ -15,11 +15,12 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 # ================== SOZLAMALAR ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT_TOKENINGIZNI_BU_YERGA_QOYING")
-OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))  # O'zingizning Telegram ID
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
+OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else 0
 DATA_FILE = Path("data.json")
-CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "")  # Masalan: -1001234567890
-# Botni saqlash kanaliga admin qilib qo'ying.
+# Anime postlari saqlanadigan kanal ID sini STORAGE_CHANNEL_ID environment variable orqali berish mumkin.
+CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "").strip()
 # =================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +31,7 @@ dp = Dispatcher()
 def default_data():
     return {
         "admins": [OWNER_ID],
-        "start_text": "🎬 <b>Anime olamiga xush kelibsiz!</b>\\n\\n🔎 Anime kodini yuboring yoki menyudan tanlang.",
+        "start_text": "🏴‍☠️ <b>ANIME OLAMIGA XUSH KELIBSIZ!</b>\n\n🍿 Sevimli animelaringizni biz bilan tomosha qiling!\n\n🔎 Anime topish uchun quyidagi menyudan foydalaning.\n✨ <b>ANIME UZ</b>",
         "channels": [],
         "animes": {}
     }
@@ -58,14 +59,24 @@ def is_admin(user_id: int) -> bool:
     return user_id in load_data()["admins"]
 
 
+async def send_start(message: Message):
+    data = load_data()
+    await message.answer(data["start_text"], reply_markup=main_menu())
+
+
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔎 Anime kodini kiritish", callback_data="search")],
-        [
-            InlineKeyboardButton(text="📚 Anime ro'yxati", callback_data="list"),
-            InlineKeyboardButton(text="👤 Kabinet", callback_data="cabinet"),
-        ],
-        [InlineKeyboardButton(text="🛠 Admin paneli", callback_data="admin")]
+        [InlineKeyboardButton(text="🔎 Anime izlash", callback_data="search_menu")],
+        [InlineKeyboardButton(text="📖 Qo'llanma", callback_data="guide")],
+    ])
+
+
+def search_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔤 Nom bo'yicha", callback_data="search_name")],
+        [InlineKeyboardButton(text="🔢 Kod bo'yicha", callback_data="search")],
+        [InlineKeyboardButton(text="📚 Barcha animelar", callback_data="list")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
     ])
 
 
@@ -91,12 +102,12 @@ def admin_menu():
         ],
         [InlineKeyboardButton(text="📝 /start xabarini o'zgartirish", callback_data="start_text")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
-        [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="home")]
     ])
 
 
 class Form(StatesGroup):
     search_code = State()
+    search_name = State()
     anime_code = State()
     anime_name = State()
     episode_code = State()
@@ -152,10 +163,9 @@ async def require_subscription_message(message: Message) -> bool:
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
-    data = load_data()
     if not await require_subscription_message(message):
         return
-    await message.answer(data["start_text"], reply_markup=main_menu())
+    await send_start(message)
 
 
 @dp.message(Command("admin"))
@@ -168,8 +178,47 @@ async def admin_command(message: Message):
 @dp.callback_query(F.data == "home")
 async def home(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.answer(load_data()["start_text"], reply_markup=main_menu())
+    await send_start(call.message)
     await call.answer()
+
+
+@dp.callback_query(F.data == "search_menu")
+async def search_menu_open(call: CallbackQuery):
+    await call.message.answer("🔎 <b>Anime izlash</b>\nQidirish usulini tanlang:", reply_markup=search_menu())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "guide")
+async def guide(call: CallbackQuery):
+    await call.message.answer(
+        "📖 <b>Qo'llanma</b>\n\n1️⃣ «Anime izlash» tugmasini bosing.\n"
+        "2️⃣ Nom bo'yicha, kod bo'yicha yoki barcha animelar ro'yxatidan tanlang.\n"
+        "3️⃣ Anime ichidan kerakli qismni bosing.\n\n⬅️ Orqaga qaytish uchun tugmalardan foydalaning.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "search_name")
+async def search_name_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.search_name)
+    await call.message.answer("🔤 Anime nomini yoki nomining bir qismini yozing:")
+    await call.answer()
+
+
+@dp.message(Form.search_name)
+async def search_name_result(message: Message, state: FSMContext):
+    await state.clear()
+    if not await require_subscription_message(message):
+        return
+    query = (message.text or "").strip().casefold()
+    data = load_data()
+    matches = [(code, anime) for code, anime in data["animes"].items() if query in anime["name"].casefold()]
+    if not matches:
+        return await message.answer("❌ Bu nom bo'yicha anime topilmadi.", reply_markup=search_menu())
+    rows = [[InlineKeyboardButton(text=f"🎬 {anime['name']} · {code}", callback_data=f"show:{code}")] for code, anime in matches[:80]]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
+    await message.answer("🔎 <b>Topilgan animelar</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @dp.callback_query(F.data == "search")
@@ -190,7 +239,7 @@ async def search_code(message: Message, state: FSMContext):
     if not anime:
         return await message.answer("❌ Bu kod bo'yicha anime topilmadi.")
     episodes = anime.get("episodes", {})
-    text = f"🎬 <b>{anime['name']}</b>\\n🔢 Kod: <code>{code}</code>\\n📺 Qismlar: {len(episodes)}"
+    text = f"🎬 <b>{anime['name']}</b>\n🔢 Kod: <code>{code}</code>\n📺 Qismlar: {len(episodes)}"
     rows = []
     for number in sorted(episodes, key=lambda x: int(x) if str(x).isdigit() else 0):
         rows.append([InlineKeyboardButton(
@@ -226,11 +275,12 @@ async def send_episode(call: CallbackQuery):
 async def anime_list(call: CallbackQuery):
     data = load_data()
     if not data["animes"]:
-        await call.message.answer("📭 Hozircha anime qo'shilmagan.")
+        await call.message.answer("📭 Hozircha anime qo'shilmagan.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")]]))
     else:
         rows = [[InlineKeyboardButton(text=f"🎬 {a['name']} · {code}", callback_data=f"show:{code}")]
                 for code, a in list(data["animes"].items())[:80]]
-        await call.message.answer("📚 <b>Anime ro'yxati</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
+        await call.message.answer("📚 <b>Barcha animelar</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
 
 
@@ -243,29 +293,12 @@ async def show_anime(call: CallbackQuery):
     anime = data["animes"][code]
     rows = [[InlineKeyboardButton(text=f"▶️ {n}-qism", callback_data=f"episode:{code}:{n}")]
             for n in anime.get("episodes", {})]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="list")])
     await call.message.answer(
-        f"🎬 <b>{anime['name']}</b>\\n🔢 Kod: <code>{code}</code>\\n📺 Qismlar: {len(rows)}",
+        f"🎬 <b>{anime['name']}</b>\n🔢 Kod: <code>{code}</code>\n📺 Qismlar: {len(rows)}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
     await call.answer()
-
-
-@dp.callback_query(F.data == "cabinet")
-async def cabinet(call: CallbackQuery):
-    await call.message.answer(
-        f"👤 <b>Kabinet</b>\\n🆔 ID: <code>{call.from_user.id}</code>\\n"
-        f"👑 Admin: {'Ha' if is_admin(call.from_user.id) else 'Yoʻq'}"
-    )
-    await call.answer()
-
-
-@dp.callback_query(F.data == "admin")
-async def admin_panel(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("⛔ Adminlar uchun.", show_alert=True)
-    else:
-        await call.message.answer("👑 <b>Admin paneli</b>", reply_markup=admin_menu())
-        await call.answer()
 
 
 async def ask(call: CallbackQuery, state: FSMContext, new_state: State, prompt: str):
@@ -283,6 +316,9 @@ async def add_anime(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.anime_code)
 async def anime_code(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     code = (message.text or "").strip()
     data = load_data()
     if not code or code in data["animes"]:
@@ -294,6 +330,9 @@ async def anime_code(message: Message, state: FSMContext):
 
 @dp.message(Form.anime_name)
 async def anime_name(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     name = (message.text or "").strip()
     if not name:
         return await message.answer("Anime nomini matn ko'rinishida yuboring:")
@@ -312,6 +351,9 @@ async def add_episode(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.episode_code)
 async def episode_code(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     code = (message.text or "").strip()
     data = load_data()
     if code not in data["animes"]:
@@ -323,6 +365,9 @@ async def episode_code(message: Message, state: FSMContext):
 
 @dp.message(Form.episode_number)
 async def episode_number(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     number = (message.text or "").strip()
     if not number.isdigit() or int(number) < 1:
         return await message.answer("Qism raqami musbat son bo'lishi kerak:")
@@ -337,6 +382,9 @@ async def episode_number(message: Message, state: FSMContext):
 
 @dp.message(Form.episode_message)
 async def episode_message(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     if not is_admin(message.from_user.id):
         await state.clear()
         return
@@ -371,6 +419,9 @@ async def del_anime(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.delete_code)
 async def delete_anime(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     code = (message.text or "").strip()
     data = load_data()
     if code not in data["animes"]:
@@ -389,6 +440,9 @@ async def del_episode(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.delete_episode_code)
 async def delete_episode_ask_number(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     code = (message.text or "").strip()
     data = load_data()
     if code not in data["animes"]:
@@ -400,6 +454,9 @@ async def delete_episode_ask_number(message: Message, state: FSMContext):
 
 @dp.message(Form.delete_episode_number)
 async def delete_episode_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     number = (message.text or "").strip()
     saved = await state.get_data()
     data = load_data()
@@ -419,6 +476,9 @@ async def rename_start(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.rename_code)
 async def rename_code(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     code = (message.text or "").strip()
     if code not in load_data()["animes"]:
         return await message.answer("❌ Kod topilmadi:")
@@ -429,6 +489,9 @@ async def rename_code(message: Message, state: FSMContext):
 
 @dp.message(Form.rename_name)
 async def rename_name(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     saved = await state.get_data()
     data = load_data()
     data["animes"][saved["rename_code"]]["name"] = (message.text or "").strip()
@@ -444,6 +507,9 @@ async def recode_start(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.recode_old)
 async def recode_old(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     old = (message.text or "").strip()
     if old not in load_data()["animes"]:
         return await message.answer("❌ Eski kod topilmadi:")
@@ -454,6 +520,9 @@ async def recode_old(message: Message, state: FSMContext):
 
 @dp.message(Form.recode_new)
 async def recode_new(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     new = (message.text or "").strip()
     saved = await state.get_data()
     data = load_data()
@@ -472,6 +541,9 @@ async def add_admin_start(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.admin_id_add)
 async def add_admin_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     try:
         user_id = int((message.text or "").strip())
     except ValueError:
@@ -491,6 +563,9 @@ async def del_admin_start(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.admin_id_del)
 async def del_admin_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     try:
         user_id = int((message.text or "").strip())
     except ValueError:
@@ -512,6 +587,9 @@ async def add_channel_start(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.channel_add)
 async def add_channel_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     channel = (message.text or "").strip()
     data = load_data()
     if channel and channel not in data["channels"]:
@@ -528,6 +606,9 @@ async def del_channel_start(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.channel_del)
 async def del_channel_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     channel = (message.text or "").strip()
     data = load_data()
     if channel in data["channels"]:
@@ -544,6 +625,9 @@ async def start_text_start(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.start_text)
 async def start_text_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     data = load_data()
     data["start_text"] = message.html_text or message.text or ""
     save_data(data)
@@ -558,8 +642,8 @@ async def stats(call: CallbackQuery):
     data = load_data()
     total_episodes = sum(len(a.get("episodes", {})) for a in data["animes"].values())
     await call.message.answer(
-        f"📊 <b>Statistika</b>\\n🎬 Anime: {len(data['animes'])}\\n"
-        f"🎞 Qismlar: {total_episodes}\\n👑 Adminlar: {len(data['admins'])}\\n"
+        f"📊 <b>Statistika</b>\n🎬 Anime: {len(data['animes'])}\n"
+        f"🎞 Qismlar: {total_episodes}\n👑 Adminlar: {len(data['admins'])}\n"
         f"📢 Kanallar: {len(data['channels'])}"
     )
     await call.answer()
@@ -568,10 +652,22 @@ async def stats(call: CallbackQuery):
 @dp.callback_query(F.data == "check_sub")
 async def check_sub_callback(call: CallbackQuery):
     if await check_subscription(call.from_user.id):
-        await call.message.answer(load_data()["start_text"], reply_markup=main_menu())
+        await send_start(call.message)
         await call.answer("✅ Obuna tasdiqlandi")
     else:
         await call.answer("Hamma kanallarga obuna bo'ling.", show_alert=True)
+
+
+@dp.message(Command("cancel"))
+async def cancel_command(message: Message, state: FSMContext):
+    current = await state.get_state()
+    await state.clear()
+    if current:
+        text = "✅ Joriy amal bekor qilindi."
+        if is_admin(message.from_user.id):
+            return await message.answer(text, reply_markup=admin_menu())
+        return await message.answer(text, reply_markup=main_menu())
+    await message.answer("Bekor qilinadigan amal yo'q.")
 
 
 @dp.message()
@@ -586,18 +682,18 @@ async def fallback(message: Message):
             rows = [[InlineKeyboardButton(text=f"▶️ {n}-qism", callback_data=f"episode:{code}:{n}")]
                     for n in anime.get("episodes", {})]
             await message.answer(
-                f"🎬 <b>{anime['name']}</b>\\n🔢 Kod: <code>{code}</code>\\n📺 Qismlar: {len(rows)}",
+                f"🎬 <b>{anime['name']}</b>\n🔢 Kod: <code>{code}</code>\n📺 Qismlar: {len(rows)}",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
             )
         else:
             await message.answer("❌ Kod topilmadi. Qayta tekshiring.")
     elif message.text:
-        await message.answer("Menyudan foydalaning yoki anime kodini yuboring.", reply_markup=main_menu())
+        await message.answer("Menyudan foydalaning.", reply_markup=main_menu())
 
 
 async def main():
-    if BOT_TOKEN == "BOT_TOKENINGIZNI_BU_YERGA_QOYING":
-        raise RuntimeError("BOT_TOKEN ni kodda yoki BOT_TOKEN environment variable orqali kiriting.")
+    if not BOT_TOKEN or not OWNER_ID:
+        raise RuntimeError("Render Environment Variables bo'limida BOT_TOKEN va OWNER_ID ni kiriting.")
     if not load_data().get("admins"):
         data = load_data()
         data["admins"] = [OWNER_ID]
