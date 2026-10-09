@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -691,14 +692,39 @@ async def fallback(message: Message):
         await message.answer("Menyudan foydalaning.", reply_markup=main_menu())
 
 
+async def health_check(request: web.Request) -> web.Response:
+    """Render health check uchun oddiy HTTP endpoint."""
+    return web.Response(text="AnimeBot is running", status=200)
+
+
+async def start_web_server():
+    # Render PORT qiymatini o'zi beradi; odatda 10000 bo'ladi.
+    port = int(os.getenv("PORT", "10000"))
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logging.info("Health server 0.0.0.0:%s portida ishga tushdi", port)
+    return runner
+
+
 async def main():
     if not BOT_TOKEN or not OWNER_ID:
         raise RuntimeError("Render Environment Variables bo'limida BOT_TOKEN va OWNER_ID ni kiriting.")
-    if not load_data().get("admins"):
-        data = load_data()
-        data["admins"] = [OWNER_ID]
+    data = load_data()
+    if OWNER_ID not in data.get("admins", []):
+        data.setdefault("admins", []).append(OWNER_ID)
         save_data(data)
-    await dp.start_polling(bot)
+
+    runner = await start_web_server()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
