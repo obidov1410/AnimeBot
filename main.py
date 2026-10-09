@@ -74,8 +74,8 @@ def main_menu():
 
 def search_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔢 Kod", callback_data="search") , InlineKeyboardButton(text="🔠 Nom", callback_data="search_name")],
-        [InlineKeyboardButton(text="📚 Ro'yxat", callback_data="list")],
+        [InlineKeyboardButton(text="🔢 Kod bo‘yicha qidirish", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo‘yicha qidirish", callback_data="search_name")],
+        [InlineKeyboardButton(text="📚 Animelar ro‘yxati", callback_data="list")],
         [InlineKeyboardButton(text="🛑 Orqaga", callback_data="home")],
     ])
 
@@ -259,7 +259,7 @@ async def search_menu_open(call: CallbackQuery):
 
 @dp.callback_query(F.data == "guide")
 async def guide(call: CallbackQuery):
-    text = "📖 <b>Qo'llanma</b>\n\n1️⃣ Anime izlashni bosing.\n2️⃣ 🔢 Kod, 🔠 Nom yoki 📚 Ro'yxatni tanlang.\n3️⃣ Anime sahifasidan kerakli qism raqamini bosing.\n\n🛑 Orqaga tugmasi oldingi menyuga qaytaradi."
+    text = "📖 <b>Qo'llanma</b>\n\n1️⃣ Anime izlashni bosing.\n2️⃣ 🔢 Kod bo‘yicha qidirish, 🔠 Nom bo‘yicha qidirish yoki 📚 Animelar ro‘yxatini tanlang.\n3️⃣ Anime sahifasidan kerakli qism raqamini bosing.\n\n🛑 Orqaga tugmasi oldingi menyuga qaytaradi."
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛑 Orqaga", callback_data="home")]])
     try:
         await call.message.edit_text(text, reply_markup=kb)
