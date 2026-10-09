@@ -1,298 +1,609 @@
-import asyncio, logging, os, sqlite3
-from contextlib import closing
-from aiohttp import web
-from aiogram import Bot, Dispatcher, Router, F
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+
+# ================== SOZLAMALAR ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT_TOKENINGIZNI_BU_YERGA_QOYING")
+OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))  # O'zingizning Telegram ID
+DATA_FILE = Path("data.json")
+CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "")  # Masalan: -1001234567890
+# Botni saqlash kanaliga admin qilib qo'ying.
+# =================================================
 
 logging.basicConfig(level=logging.INFO)
-BOT_TOKEN=os.getenv("BOT_TOKEN")
-OWNER_ID=int(os.getenv("OWNER_ID","0"))
-DB_PATH=os.getenv("DB_PATH","anime_bot.db")
-PORT=int(os.getenv("PORT","10000"))
-if not BOT_TOKEN or not OWNER_ID:
-    raise RuntimeError("BOT_TOKEN and OWNER_ID are required.")
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
-bot=Bot(BOT_TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp=Dispatcher(storage=MemoryStorage()); router=Router(); dp.include_router(router)
 
-def con(): return sqlite3.connect(DB_PATH)
-def init_db():
-    with closing(con()) as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT,joined_at TEXT DEFAULT CURRENT_TIMESTAMP);
-        CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY);
-        CREATE TABLE IF NOT EXISTS animes(code INTEGER PRIMARY KEY,name TEXT NOT NULL,channel_id TEXT NOT NULL,message_id INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS subscriptions(channel_id TEXT PRIMARY KEY,channel_name TEXT);
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
-        """)
-        c.execute("INSERT OR IGNORE INTO settings VALUES('enabled','1')")
-        c.execute("INSERT OR IGNORE INTO settings VALUES('start_text','👋 <b>Anime botga xush kelibsiz!</b>\n\n🔢 Anime kodini yuboring.')")
-        c.commit()
+def default_data():
+    return {
+        "admins": [OWNER_ID],
+        "start_text": "🎬 <b>Anime olamiga xush kelibsiz!</b>\\n\\n🔎 Anime kodini yuboring yoki menyudan tanlang.",
+        "channels": [],
+        "animes": {}
+    }
 
-def setting(k,d=""):
-    with closing(con()) as c:
-        r=c.execute("SELECT value FROM settings WHERE key=?",(k,)).fetchone()
-        return r[0] if r else d
-def set_setting(k,v):
-    with closing(con()) as c:
-        c.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(k,v)); c.commit()
-def is_admin(uid):
-    if uid==OWNER_ID:return True
-    with closing(con()) as c:return c.execute("SELECT 1 FROM admins WHERE user_id=?",(uid,)).fetchone() is not None
-def save_user(m):
-    with closing(con()) as c:
-        old=c.execute("SELECT 1 FROM users WHERE user_id=?",(m.from_user.id,)).fetchone()
-        c.execute("INSERT OR IGNORE INTO users(user_id,username) VALUES(?,?)",(m.from_user.id,m.from_user.username)); c.commit()
-    return old is None
-def next_code():
-    with closing(con()) as c:return c.execute("SELECT COALESCE(MAX(code),0)+1 FROM animes").fetchone()[0]
-def get_anime(code):
-    with closing(con()) as c:return c.execute("SELECT code,name,channel_id,message_id FROM animes WHERE code=?",(code,)).fetchone()
 
-def user_kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🔢 Anime kodini kiritish")],
-        [KeyboardButton(text="ℹ️ Bot haqida"),KeyboardButton(text="📢 Kanallar")]
-    ],resize_keyboard=True)
-
-def panel_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Anime qo‘shish",callback_data="add")],
-        [InlineKeyboardButton(text="📝 Nomini o‘zgartirish",callback_data="rename"),
-         InlineKeyboardButton(text="🗑 O‘chirish",callback_data="delete")],
-        [InlineKeyboardButton(text="📋 Anime ro‘yxati",callback_data="list"),
-         InlineKeyboardButton(text="📊 Statistika",callback_data="stats")],
-        [InlineKeyboardButton(text="👑 Adminlar",callback_data="admins"),
-         InlineKeyboardButton(text="📢 Majburiy obuna",callback_data="subs")],
-        [InlineKeyboardButton(text="✏️ Start xabari",callback_data="start"),
-         InlineKeyboardButton(text="⏸ Botni yoqish/o‘chirish",callback_data="toggle")]
-    ])
-def back(): return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Admin panel",callback_data="panel")]])
-
-async def sub_ok(uid):
-    with closing(con()) as c: rows=c.execute("SELECT channel_id FROM subscriptions").fetchall()
-    for (cid,) in rows:
-        try:
-            m=await bot.get_chat_member(cid,uid)
-            if m.status in ("left","kicked"): return False
-        except: return False
-    return True
-async def sub_kb():
-    with closing(con()) as c: rows=c.execute("SELECT channel_id,channel_name FROM subscriptions").fetchall()
-    b=[]
-    for cid,name in rows:
-        try:
-            chat=await bot.get_chat(cid)
-            url=f"https://t.me/{chat.username}" if chat.username else None
-            if url:b.append([InlineKeyboardButton(text=f"📢 {name or chat.title}",url=url)])
-        except: pass
-    b.append([InlineKeyboardButton(text="✅ Tekshirish",callback_data="check")])
-    return InlineKeyboardMarkup(inline_keyboard=b)
-
-class Add(StatesGroup): post=State(); name=State()
-class Rename(StatesGroup): code=State(); name=State()
-class Delete(StatesGroup): code=State()
-class Admin(StatesGroup): uid=State()
-class Sub(StatesGroup): channel=State()
-class StartEdit(StatesGroup): text=State()
-
-@router.message(CommandStart())
-async def start(m:Message):
-    new=save_user(m)
-    if not await sub_ok(m.from_user.id) and not is_admin(m.from_user.id):
-        await m.answer("📢 Avval majburiy kanallarga obuna bo‘ling.",reply_markup=await sub_kb()); return
-    if setting("enabled","1")!="1" and not is_admin(m.from_user.id):
-        await m.answer("⏸ Bot vaqtincha to‘xtatilgan."); return
-    await m.answer(setting("start_text"),reply_markup=user_kb())
-    if new:
-        with closing(con()) as c: total=c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        try: await bot.send_message(OWNER_ID,f"🆕 Yangi foydalanuvchi\n👤 @{m.from_user.username or 'yo‘q'}\n🔢 ID: <code>{m.from_user.id}</code>\n👥 Jami: {total}")
-        except: pass
-
-@router.callback_query(F.data=="check")
-async def check(q:CallbackQuery):
-    if await sub_ok(q.from_user.id): await q.message.answer("✅ Obuna tasdiqlandi!",reply_markup=user_kb())
-    else: await q.answer("❌ Hali obuna bo‘lmagansiz.",show_alert=True)
-
-@router.message(F.text=="🔢 Anime kodini kiritish")
-async def code_help(m:Message): await m.answer("🔢 Anime kodini yuboring:")
-@router.message(F.text=="ℹ️ Bot haqida")
-async def about(m:Message): await m.answer("🎌 Anime Bot\n\nFaqat anime kodi orqali qidirish mumkin.",reply_markup=user_kb())
-@router.message(F.text=="📢 Kanallar")
-async def channels(m:Message): await m.answer("📢 Majburiy obuna:",reply_markup=await sub_kb())
-
-@router.message(F.text.regexp(r"^\d+$"))
-async def find(m:Message):
-    if not await sub_ok(m.from_user.id) and not is_admin(m.from_user.id):
-        await m.answer("📢 Avval obuna bo‘ling.",reply_markup=await sub_kb()); return
-    a=get_anime(int(m.text))
-    if not a: await m.answer("❌ Anime kodi topilmadi."); return
-    code,name,cid,mid=a
-    await m.answer(f"🎬 <b>{name}</b>\n🔢 Kod: <code>{code}</code>")
-    try: await bot.copy_message(m.chat.id,cid,mid)
-    except: await m.answer("❌ Kanal postini yuborib bo‘lmadi.")
-
-@router.message(Command("admin"))
-async def admin_cmd(m:Message):
-    if is_admin(m.from_user.id): await m.answer("⚙️ <b>Admin panel</b>",reply_markup=panel_kb())
-
-@router.callback_query(F.data=="panel")
-async def panel(q:CallbackQuery):
-    if is_admin(q.from_user.id): await q.message.edit_text("⚙️ <b>Admin panel</b>",reply_markup=panel_kb())
-
-@router.callback_query(F.data=="add")
-async def add_start(q:CallbackQuery,state:FSMContext):
-    if not is_admin(q.from_user.id):return
-    await state.set_state(Add.post); await q.message.answer("📨 Kanalga joylangan anime postini <b>forward</b> qilib yuboring.")
-@router.message(Add.post)
-async def add_post(m:Message,state:FSMContext):
-    if not is_admin(m.from_user.id) or not m.forward_origin:
-        await m.answer("❌ Kanal postini forward qiling."); return
-    o=m.forward_origin; chat=getattr(o,"chat",None); mid=getattr(o,"message_id",None)
-    if not chat or not mid: await m.answer("❌ Kanal postini aniqlab bo‘lmadi."); return
-    code=next_code(); await state.update_data(code=code,cid=str(chat.id),mid=mid)
-    await state.set_state(Add.name); await m.answer(f"🔢 Avtomatik kod: <code>{code}</code>\n📝 Anime nomini yuboring:")
-@router.message(Add.name)
-async def add_name(m:Message,state:FSMContext):
-    d=await state.get_data(); await state.update_data(name=m.text.strip())
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Tasdiqlash",callback_data="confirm_add"),InlineKeyboardButton(text="❌ Bekor",callback_data="cancel")]])
-    await m.answer(f"📋 Kod: {d['code']}\n🎬 Nomi: {m.text}\n\nTasdiqlaysizmi?",reply_markup=kb)
-@router.callback_query(F.data=="confirm_add")
-async def confirm_add(q:CallbackQuery,state:FSMContext):
-    d=await state.get_data()
-    with closing(con()) as c:c.execute("INSERT INTO animes VALUES(?,?,?,?)",(d["code"],d["name"],d["cid"],d["mid"]));c.commit()
-    await state.clear(); await q.message.edit_text("✅ Anime qo‘shildi.",reply_markup=back())
-@router.callback_query(F.data=="cancel")
-async def cancel(q:CallbackQuery,state:FSMContext):
-    await state.clear(); await q.message.edit_text("❌ Bekor qilindi.",reply_markup=back())
-
-@router.callback_query(F.data=="rename")
-async def ren_start(q:CallbackQuery,state:FSMContext):
-    if not is_admin(q.from_user.id):return
-    await state.set_state(Rename.code); await q.message.answer("🔢 Anime kodini yuboring:")
-@router.message(Rename.code)
-async def ren_code(m:Message,state:FSMContext):
-    if not m.text.isdigit() or not get_anime(int(m.text)): await m.answer("❌ Kod topilmadi."); return
-    await state.update_data(code=int(m.text)); await state.set_state(Rename.name); await m.answer("📝 Yangi nom:")
-@router.message(Rename.name)
-async def ren_name(m:Message,state:FSMContext):
-    d=await state.get_data(); await state.update_data(name=m.text.strip())
-    await m.answer(f"🎬 Yangi nom: <b>{m.text}</b>\nTasdiqlash uchun /confirmname, bekor qilish uchun /cancel")
-@router.message(Command("confirmname"),Rename.name)
-async def ren_confirm(m:Message,state:FSMContext):
-    d=await state.get_data()
-    with closing(con()) as c:c.execute("UPDATE animes SET name=? WHERE code=?",(d["name"],d["code"]));c.commit()
-    await state.clear(); await m.answer("✅ Nom o‘zgartirildi.")
-
-@router.callback_query(F.data=="delete")
-async def del_start(q:CallbackQuery,state:FSMContext):
-    if not is_admin(q.from_user.id):return
-    await state.set_state(Delete.code); await q.message.answer("🗑 O‘chiriladigan anime kodini yuboring:")
-@router.message(Delete.code)
-async def del_code(m:Message,state:FSMContext):
-    if not m.text.isdigit() or not get_anime(int(m.text)): await m.answer("❌ Kod topilmadi."); return
-    await state.update_data(code=int(m.text)); await m.answer("⚠️ Tasdiqlash uchun /confirmdelete, bekor qilish uchun /cancel")
-@router.message(Command("confirmdelete"),Delete.code)
-async def del_confirm(m:Message,state:FSMContext):
-    d=await state.get_data()
-    with closing(con()) as c:c.execute("DELETE FROM animes WHERE code=?",(d["code"],));c.commit()
-    await state.clear(); await m.answer("✅ Anime o‘chirildi.")
-
-@router.callback_query(F.data=="list")
-async def listing(q:CallbackQuery):
-    if not is_admin(q.from_user.id):return
-    with closing(con()) as c:r=c.execute("SELECT code,name FROM animes ORDER BY code DESC LIMIT 50").fetchall()
-    text="📋 <b>Animelar</b>\n\n"+("\n".join(f"<code>{x}</code> — {n}" for x,n in r) or "Hozircha yo‘q.")
-    await q.message.edit_text(text,reply_markup=back())
-
-@router.callback_query(F.data=="stats")
-async def stats(q:CallbackQuery):
-    if not is_admin(q.from_user.id):return
-    with closing(con()) as c:
-        u=c.execute("SELECT COUNT(*) FROM users").fetchone()[0]; a=c.execute("SELECT COUNT(*) FROM animes").fetchone()[0]; ad=c.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
-    await q.message.edit_text(f"📊 <b>Statistika</b>\n\n👥 {u} foydalanuvchi\n🎬 {a} anime\n👑 {ad} admin",reply_markup=back())
-
-@router.callback_query(F.data=="admins")
-async def admins(q:CallbackQuery):
-    if q.from_user.id!=OWNER_ID:return
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Admin qo‘shish",callback_data="addadmin")],[InlineKeyboardButton(text="➖ Admin o‘chirish",callback_data="deladmin")],[InlineKeyboardButton(text="⬅️ Orqaga",callback_data="panel")]])
-    await q.message.edit_text("👑 <b>Adminlar</b>",reply_markup=kb)
-@router.callback_query(F.data=="addadmin")
-async def addadmin(q:CallbackQuery,state:FSMContext):
-    if q.from_user.id!=OWNER_ID:return
-    await state.set_state(Admin.uid); await q.message.answer("Telegram ID yuboring:")
-@router.message(Admin.uid)
-async def addadmin_save(m:Message,state:FSMContext):
-    if m.from_user.id!=OWNER_ID or not m.text.isdigit():return
-    with closing(con()) as c:c.execute("INSERT OR IGNORE INTO admins VALUES(?)",(int(m.text),));c.commit()
-    await state.clear(); await m.answer("✅ Admin qo‘shildi.")
-@router.callback_query(F.data=="deladmin")
-async def deladmin(q:CallbackQuery,state:FSMContext):
-    if q.from_user.id!=OWNER_ID:return
-    await state.set_state(Admin.uid); await q.message.answer("O‘chiriladigan admin ID:")
-@router.message(Admin.uid)
-async def deladmin_save(m:Message,state:FSMContext):
-    if m.from_user.id!=OWNER_ID:return
-    if m.text.isdigit():
-        with closing(con()) as c:c.execute("DELETE FROM admins WHERE user_id=?",(int(m.text),));c.commit()
-    await state.clear(); await m.answer("✅ Bajarildi.")
-
-@router.callback_query(F.data=="subs")
-async def subs(q:CallbackQuery):
-    if not is_admin(q.from_user.id):return
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Kanal qo‘shish",callback_data="addsub")],[InlineKeyboardButton(text="➖ Kanal o‘chirish",callback_data="delsub")],[InlineKeyboardButton(text="⬅️ Orqaga",callback_data="panel")]])
-    await q.message.edit_text("📢 <b>Majburiy obuna</b>",reply_markup=kb)
-@router.callback_query(F.data=="addsub")
-async def addsub(q:CallbackQuery,state:FSMContext):
-    await state.set_state(Sub.channel); await q.message.answer("Kanal @username yoki -100... ID'sini yuboring:")
-@router.message(Sub.channel)
-async def addsub_save(m:Message,state:FSMContext):
+def load_data():
+    if not DATA_FILE.exists():
+        save_data(default_data())
     try:
-        chat=await bot.get_chat(m.text.strip())
-        with closing(con()) as c:c.execute("INSERT OR REPLACE INTO subscriptions VALUES(?,?)",(str(chat.id),chat.title));c.commit()
-        await m.answer(f"✅ {chat.title} qo‘shildi.")
-    except: await m.answer("❌ Kanal topilmadi. Bot kanalga admin bo‘lishi kerak.")
+        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        data = default_data()
+    for key, value in default_data().items():
+        data.setdefault(key, value)
+    return data
+
+
+def save_data(data):
+    DATA_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in load_data()["admins"]
+
+
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Anime kodini kiritish", callback_data="search")],
+        [
+            InlineKeyboardButton(text="📚 Anime ro'yxati", callback_data="list"),
+            InlineKeyboardButton(text="👤 Kabinet", callback_data="cabinet"),
+        ],
+        [InlineKeyboardButton(text="🛠 Admin paneli", callback_data="admin")]
+    ])
+
+
+def admin_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Anime qo'shish", callback_data="add_anime")],
+        [
+            InlineKeyboardButton(text="➕ Qism qo'shish", callback_data="add_episode"),
+            InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_anime"),
+            InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="recode_anime"),
+        ],
+        [InlineKeyboardButton(text="🗑 Anime o'chirish", callback_data="del_anime")],
+        [
+            InlineKeyboardButton(text="👑 Admin qo'shish", callback_data="add_admin"),
+            InlineKeyboardButton(text="🚫 Admin o'chirish", callback_data="del_admin"),
+        ],
+        [
+            InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="add_channel"),
+            InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="del_channel"),
+        ],
+        [InlineKeyboardButton(text="📝 /start xabarini o'zgartirish", callback_data="start_text")],
+        [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
+        [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="home")]
+    ])
+
+
+class Form(StatesGroup):
+    search_code = State()
+    anime_code = State()
+    anime_name = State()
+    episode_code = State()
+    episode_number = State()
+    episode_message = State()
+    delete_code = State()
+    delete_episode_code = State()
+    delete_episode_number = State()
+    rename_code = State()
+    rename_name = State()
+    recode_old = State()
+    recode_new = State()
+    admin_id_add = State()
+    admin_id_del = State()
+    channel_add = State()
+    channel_del = State()
+    start_text = State()
+
+
+async def check_subscription(user_id: int) -> bool:
+    channels = load_data()["channels"]
+    for channel in channels:
+        try:
+            member = await bot.get_chat_member(channel, user_id)
+            if member.status not in ("creator", "administrator", "member"):
+                return False
+        except Exception:
+            # Kanal ID/username noto'g'ri bo'lsa, xavfsizlik uchun obunani tasdiqlamaymiz.
+            return False
+    return True
+
+
+def subscription_keyboard():
+    rows = []
+    for channel in load_data()["channels"]:
+        url = f"https://t.me/{channel.lstrip('@')}" if str(channel).startswith("@") else None
+        if url:
+            rows.append([InlineKeyboardButton(text=f"📢 {channel}", url=url)])
+    rows.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def require_subscription_message(message: Message) -> bool:
+    if await check_subscription(message.from_user.id):
+        return True
+    await message.answer(
+        "🔒 <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling.</b>",
+        reply_markup=subscription_keyboard()
+    )
+    return False
+
+
+@dp.message(CommandStart())
+async def start(message: Message, state: FSMContext):
     await state.clear()
-@router.callback_query(F.data=="delsub")
-async def delsub(q:CallbackQuery,state:FSMContext):
-    await state.set_state(Sub.channel); await q.message.answer("Kanal ID'sini yuboring:")
-@router.message(Sub.channel)
-async def delsub_save(m:Message,state:FSMContext):
-    with closing(con()) as c:c.execute("DELETE FROM subscriptions WHERE channel_id=?",(m.text.strip(),));c.commit()
-    await state.clear(); await m.answer("✅ Kanal o‘chirildi.")
+    data = load_data()
+    if not await require_subscription_message(message):
+        return
+    await message.answer(data["start_text"], reply_markup=main_menu())
 
-@router.callback_query(F.data=="start")
-async def edit_start(q:CallbackQuery,state:FSMContext):
-    if not is_admin(q.from_user.id):return
-    await state.set_state(StartEdit.text); await q.message.answer("✏️ Yangi start xabarini yuboring:")
-@router.message(StartEdit.text)
-async def save_start(m:Message,state:FSMContext):
-    set_setting("start_text",m.text); await state.clear(); await m.answer("✅ Start xabari yangilandi.")
 
-@router.callback_query(F.data=="toggle")
-async def toggle(q:CallbackQuery):
-    if q.from_user.id!=OWNER_ID:return
-    v="0" if setting("enabled","1")=="1" else "1"; set_setting("enabled",v)
-    await q.message.edit_text(("▶️ Bot yoqildi." if v=="1" else "⏸ Bot to‘xtatildi."),reply_markup=back())
+@dp.message(Command("admin"))
+async def admin_command(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("⛔ Sizda admin huquqi yo'q.")
+    await message.answer("👑 <b>Admin paneli</b>", reply_markup=admin_menu())
 
-async def root(_): return web.Response(text="Anime bot is running.")
-async def health(_): return web.json_response({"status":"ok"})
-async def webserver():
-    app=web.Application(); app.router.add_get("/",root); app.router.add_get("/health",health)
-    runner=web.AppRunner(app); await runner.setup(); await web.TCPSite(runner,"0.0.0.0",PORT).start(); return runner
+
+@dp.callback_query(F.data == "home")
+async def home(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer(load_data()["start_text"], reply_markup=main_menu())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "search")
+async def search_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.search_code)
+    await call.message.answer("🔢 Anime kodini yuboring:")
+    await call.answer()
+
+
+@dp.message(Form.search_code)
+async def search_code(message: Message, state: FSMContext):
+    await state.clear()
+    if not await require_subscription_message(message):
+        return
+    data = load_data()
+    code = message.text.strip() if message.text else ""
+    anime = data["animes"].get(code)
+    if not anime:
+        return await message.answer("❌ Bu kod bo'yicha anime topilmadi.")
+    episodes = anime.get("episodes", {})
+    text = f"🎬 <b>{anime['name']}</b>\\n🔢 Kod: <code>{code}</code>\\n📺 Qismlar: {len(episodes)}"
+    rows = []
+    for number in sorted(episodes, key=lambda x: int(x) if str(x).isdigit() else 0):
+        rows.append([InlineKeyboardButton(
+            text=f"▶️ {number}-qism", callback_data=f"episode:{code}:{number}"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="home")])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("episode:"))
+async def send_episode(call: CallbackQuery):
+    if not await check_subscription(call.from_user.id):
+        await call.message.answer(
+            "🔒 Avval kanallarga obuna bo'ling.", reply_markup=subscription_keyboard()
+        )
+        return await call.answer()
+    try:
+        _, code, number = call.data.split(":", 2)
+        episode = load_data()["animes"][code]["episodes"][number]
+        source_chat = episode["chat_id"]
+        source_message = episode["message_id"]
+        await bot.copy_message(
+            chat_id=call.from_user.id,
+            from_chat_id=source_chat,
+            message_id=source_message
+        )
+        await call.answer("Qism yuborildi")
+    except Exception:
+        await call.answer("❌ Qism yuborilmadi. Kanal va xabarni tekshiring.", show_alert=True)
+
+
+@dp.callback_query(F.data == "list")
+async def anime_list(call: CallbackQuery):
+    data = load_data()
+    if not data["animes"]:
+        await call.message.answer("📭 Hozircha anime qo'shilmagan.")
+    else:
+        rows = [[InlineKeyboardButton(text=f"🎬 {a['name']} · {code}", callback_data=f"show:{code}")]
+                for code, a in list(data["animes"].items())[:80]]
+        await call.message.answer("📚 <b>Anime ro'yxati</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("show:"))
+async def show_anime(call: CallbackQuery):
+    code = call.data.split(":", 1)[1]
+    data = load_data()
+    if code not in data["animes"]:
+        return await call.answer("Anime topilmadi", show_alert=True)
+    anime = data["animes"][code]
+    rows = [[InlineKeyboardButton(text=f"▶️ {n}-qism", callback_data=f"episode:{code}:{n}")]
+            for n in anime.get("episodes", {})]
+    await call.message.answer(
+        f"🎬 <b>{anime['name']}</b>\\n🔢 Kod: <code>{code}</code>\\n📺 Qismlar: {len(rows)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "cabinet")
+async def cabinet(call: CallbackQuery):
+    await call.message.answer(
+        f"👤 <b>Kabinet</b>\\n🆔 ID: <code>{call.from_user.id}</code>\\n"
+        f"👑 Admin: {'Ha' if is_admin(call.from_user.id) else 'Yoʻq'}"
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "admin")
+async def admin_panel(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔ Adminlar uchun.", show_alert=True)
+    else:
+        await call.message.answer("👑 <b>Admin paneli</b>", reply_markup=admin_menu())
+        await call.answer()
+
+
+async def ask(call: CallbackQuery, state: FSMContext, new_state: State, prompt: str):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔ Adminlar uchun.", show_alert=True)
+    await state.set_state(new_state)
+    await call.message.answer(prompt)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "add_anime")
+async def add_anime(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.anime_code, "🔢 Yangi anime uchun unikal kod yuboring:")
+
+
+@dp.message(Form.anime_code)
+async def anime_code(message: Message, state: FSMContext):
+    code = (message.text or "").strip()
+    data = load_data()
+    if not code or code in data["animes"]:
+        return await message.answer("❌ Kod bo'sh yoki band. Boshqa kod yuboring:")
+    await state.update_data(new_code=code)
+    await state.set_state(Form.anime_name)
+    await message.answer("🎬 Anime nomini yuboring:")
+
+
+@dp.message(Form.anime_name)
+async def anime_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not name:
+        return await message.answer("Anime nomini matn ko'rinishida yuboring:")
+    saved = await state.get_data()
+    data = load_data()
+    data["animes"][saved["new_code"]] = {"name": name, "episodes": {}}
+    save_data(data)
+    await state.clear()
+    await message.answer(f"✅ <b>{name}</b> qo'shildi. Endi «Qism qo'shish» tugmasi orqali qismlarini kiriting.", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "add_episode")
+async def add_episode(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.episode_code, "Anime kodini yuboring:")
+
+
+@dp.message(Form.episode_code)
+async def episode_code(message: Message, state: FSMContext):
+    code = (message.text or "").strip()
+    data = load_data()
+    if code not in data["animes"]:
+        return await message.answer("❌ Bunday kodli anime yo'q. Qayta yuboring:")
+    await state.update_data(episode_code=code)
+    await state.set_state(Form.episode_number)
+    await message.answer("Qism raqamini yuboring (masalan, 1):")
+
+
+@dp.message(Form.episode_number)
+async def episode_number(message: Message, state: FSMContext):
+    number = (message.text or "").strip()
+    if not number.isdigit() or int(number) < 1:
+        return await message.answer("Qism raqami musbat son bo'lishi kerak:")
+    saved = await state.get_data()
+    await state.update_data(episode_number=number)
+    await state.set_state(Form.episode_message)
+    await message.answer(
+        f"Endi {saved['episode_code']} kodi, {number}-qism uchun video/xabarni "
+        "saqlash kanalidan shu yerga forward qiling."
+    )
+
+
+@dp.message(Form.episode_message)
+async def episode_message(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if not message.forward_from_chat and not message.forward_origin:
+        return await message.answer("❌ Kanal xabarini forward qiling yoki kanal postini botga yuboring.")
+    saved = await state.get_data()
+    source_chat = None
+    source_message = None
+    origin = message.forward_origin
+    if origin and getattr(origin, "chat", None):
+        source_chat = origin.chat.id
+        source_message = getattr(origin, "message_id", None)
+    if source_chat is None and message.forward_from_chat:
+        source_chat = message.forward_from_chat.id
+        source_message = message.forward_from_message_id
+    if source_chat is None or source_message is None:
+        return await message.answer("❌ Manba kanal/xabar ID'sini aniqlab bo'lmadi. Kanal postini forward qiling.")
+    data = load_data()
+    code, number = saved["episode_code"], saved["episode_number"]
+    data["animes"][code]["episodes"][number] = {
+        "chat_id": source_chat, "message_id": source_message
+    }
+    save_data(data)
+    await state.clear()
+    await message.answer(f"✅ {data['animes'][code]['name']} — {number}-qism saqlandi.", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "del_anime")
+async def del_anime(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.delete_code, "O'chiriladigan anime kodini yuboring:")
+
+
+@dp.message(Form.delete_code)
+async def delete_anime(message: Message, state: FSMContext):
+    code = (message.text or "").strip()
+    data = load_data()
+    if code not in data["animes"]:
+        return await message.answer("❌ Anime kodi topilmadi:")
+    name = data["animes"][code]["name"]
+    del data["animes"][code]
+    save_data(data)
+    await state.clear()
+    await message.answer(f"🗑 <b>{name}</b> o'chirildi.", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "del_episode")
+async def del_episode(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.delete_episode_code, "Qismi o'chiriladigan anime kodini yuboring:")
+
+
+@dp.message(Form.delete_episode_code)
+async def delete_episode_ask_number(message: Message, state: FSMContext):
+    code = (message.text or "").strip()
+    data = load_data()
+    if code not in data["animes"]:
+        return await message.answer("❌ Anime kodi topilmadi. Qayta yuboring:")
+    await state.update_data(delete_episode_code=code)
+    await state.set_state(Form.delete_episode_number)
+    await message.answer("O'chiriladigan qism raqamini yuboring:")
+
+
+@dp.message(Form.delete_episode_number)
+async def delete_episode_save(message: Message, state: FSMContext):
+    number = (message.text or "").strip()
+    saved = await state.get_data()
+    data = load_data()
+    code = saved["delete_episode_code"]
+    if code not in data["animes"] or number not in data["animes"][code]["episodes"]:
+        return await message.answer("❌ Bunday qism topilmadi. Qism raqamini qayta yuboring:")
+    del data["animes"][code]["episodes"][number]
+    save_data(data)
+    await state.clear()
+    await message.answer(f"🗑 {number}-qism o'chirildi.", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "rename_anime")
+async def rename_start(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.rename_code, "Nomi o'zgaradigan anime kodini yuboring:")
+
+
+@dp.message(Form.rename_code)
+async def rename_code(message: Message, state: FSMContext):
+    code = (message.text or "").strip()
+    if code not in load_data()["animes"]:
+        return await message.answer("❌ Kod topilmadi:")
+    await state.update_data(rename_code=code)
+    await state.set_state(Form.rename_name)
+    await message.answer("Yangi anime nomini yuboring:")
+
+
+@dp.message(Form.rename_name)
+async def rename_name(message: Message, state: FSMContext):
+    saved = await state.get_data()
+    data = load_data()
+    data["animes"][saved["rename_code"]]["name"] = (message.text or "").strip()
+    save_data(data)
+    await state.clear()
+    await message.answer("✅ Anime nomi o'zgartirildi.", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "recode_anime")
+async def recode_start(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.recode_old, "Eski anime kodini yuboring:")
+
+
+@dp.message(Form.recode_old)
+async def recode_old(message: Message, state: FSMContext):
+    old = (message.text or "").strip()
+    if old not in load_data()["animes"]:
+        return await message.answer("❌ Eski kod topilmadi:")
+    await state.update_data(recode_old=old)
+    await state.set_state(Form.recode_new)
+    await message.answer("Yangi, band bo'lmagan kodni yuboring:")
+
+
+@dp.message(Form.recode_new)
+async def recode_new(message: Message, state: FSMContext):
+    new = (message.text or "").strip()
+    saved = await state.get_data()
+    data = load_data()
+    if not new or new in data["animes"]:
+        return await message.answer("❌ Yangi kod bo'sh yoki band:")
+    data["animes"][new] = data["animes"].pop(saved["recode_old"])
+    save_data(data)
+    await state.clear()
+    await message.answer(f"✅ Kod {new} qilib o'zgartirildi.", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "add_admin")
+async def add_admin_start(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.admin_id_add, "Admin qilinadigan foydalanuvchining Telegram ID raqamini yuboring:")
+
+
+@dp.message(Form.admin_id_add)
+async def add_admin_save(message: Message, state: FSMContext):
+    try:
+        user_id = int((message.text or "").strip())
+    except ValueError:
+        return await message.answer("Faqat raqam yuboring:")
+    data = load_data()
+    if user_id not in data["admins"]:
+        data["admins"].append(user_id)
+        save_data(data)
+    await state.clear()
+    await message.answer(f"✅ Adminlar ro'yxatiga qo'shildi: <code>{user_id}</code>", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "del_admin")
+async def del_admin_start(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.admin_id_del, "Adminlikdan olinadigan Telegram ID raqamini yuboring:")
+
+
+@dp.message(Form.admin_id_del)
+async def del_admin_save(message: Message, state: FSMContext):
+    try:
+        user_id = int((message.text or "").strip())
+    except ValueError:
+        return await message.answer("Faqat raqam yuboring:")
+    data = load_data()
+    if user_id == OWNER_ID:
+        return await message.answer("❌ Asosiy adminni o'chirib bo'lmaydi.")
+    if user_id in data["admins"]:
+        data["admins"].remove(user_id)
+        save_data(data)
+    await state.clear()
+    await message.answer("✅ Admin ro'yxati yangilandi.", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "add_channel")
+async def add_channel_start(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.channel_add, "Kanal @username yoki -100... ID raqamini yuboring. Bot kanalda admin bo'lishi kerak:")
+
+
+@dp.message(Form.channel_add)
+async def add_channel_save(message: Message, state: FSMContext):
+    channel = (message.text or "").strip()
+    data = load_data()
+    if channel and channel not in data["channels"]:
+        data["channels"].append(channel)
+        save_data(data)
+    await state.clear()
+    await message.answer("✅ Kanal ro'yxatga qo'shildi.", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "del_channel")
+async def del_channel_start(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.channel_del, "O'chiriladigan kanal @username yoki ID'sini yuboring:")
+
+
+@dp.message(Form.channel_del)
+async def del_channel_save(message: Message, state: FSMContext):
+    channel = (message.text or "").strip()
+    data = load_data()
+    if channel in data["channels"]:
+        data["channels"].remove(channel)
+        save_data(data)
+    await state.clear()
+    await message.answer("✅ Kanal ro'yxati yangilandi.", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "start_text")
+async def start_text_start(call: CallbackQuery, state: FSMContext):
+    await ask(call, state, Form.start_text, "Yangi /start xabarini yuboring. HTML teglardan foydalanishingiz mumkin:")
+
+
+@dp.message(Form.start_text)
+async def start_text_save(message: Message, state: FSMContext):
+    data = load_data()
+    data["start_text"] = message.html_text or message.text or ""
+    save_data(data)
+    await state.clear()
+    await message.answer("✅ /start xabari o'zgartirildi.", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "stats")
+async def stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Adminlar uchun", show_alert=True)
+    data = load_data()
+    total_episodes = sum(len(a.get("episodes", {})) for a in data["animes"].values())
+    await call.message.answer(
+        f"📊 <b>Statistika</b>\\n🎬 Anime: {len(data['animes'])}\\n"
+        f"🎞 Qismlar: {total_episodes}\\n👑 Adminlar: {len(data['admins'])}\\n"
+        f"📢 Kanallar: {len(data['channels'])}"
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "check_sub")
+async def check_sub_callback(call: CallbackQuery):
+    if await check_subscription(call.from_user.id):
+        await call.message.answer(load_data()["start_text"], reply_markup=main_menu())
+        await call.answer("✅ Obuna tasdiqlandi")
+    else:
+        await call.answer("Hamma kanallarga obuna bo'ling.", show_alert=True)
+
+
+@dp.message()
+async def fallback(message: Message):
+    if message.text and message.text.isdigit():
+        if not await require_subscription_message(message):
+            return
+        data = load_data()
+        code = message.text.strip()
+        if code in data["animes"]:
+            anime = data["animes"][code]
+            rows = [[InlineKeyboardButton(text=f"▶️ {n}-qism", callback_data=f"episode:{code}:{n}")]
+                    for n in anime.get("episodes", {})]
+            await message.answer(
+                f"🎬 <b>{anime['name']}</b>\\n🔢 Kod: <code>{code}</code>\\n📺 Qismlar: {len(rows)}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+            )
+        else:
+            await message.answer("❌ Kod topilmadi. Qayta tekshiring.")
+    elif message.text:
+        await message.answer("Menyudan foydalaning yoki anime kodini yuboring.", reply_markup=main_menu())
+
 
 async def main():
-    init_db(); runner=await webserver()
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
-    finally:
-        await runner.cleanup(); await bot.session.close()
+    if BOT_TOKEN == "BOT_TOKENINGIZNI_BU_YERGA_QOYING":
+        raise RuntimeError("BOT_TOKEN ni kodda yoki BOT_TOKEN environment variable orqali kiriting.")
+    if not load_data().get("admins"):
+        data = load_data()
+        data["admins"] = [OWNER_ID]
+        save_data(data)
+    await dp.start_polling(bot)
 
-if __name__=="__main__": asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
