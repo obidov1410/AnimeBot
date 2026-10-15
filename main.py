@@ -10,7 +10,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -206,16 +206,31 @@ async def notify_new_user(tg_user):
 
 async def send_start(message: Message):
     data = load_data()
+    # Xabar ostida faqat anime qidirish va qo'llanma inline tugmalari qoladi.
     await message.answer(data["start_text"], reply_markup=main_menu())
+    # Asosiy xizmatlar Telegram klaviaturasining pastki qismida doimiy turadi.
+    await message.answer("📌 Asosiy menyu", reply_markup=main_reply_keyboard())
 
 
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔎 Anime izlash", callback_data="search_menu")],
         [InlineKeyboardButton(text="📖 Qo'llanma", callback_data="guide")],
-        [InlineKeyboardButton(text="👤 Hisobim", callback_data="account")],
-        [InlineKeyboardButton(text="👑 VIP nima?", callback_data="vip_info")],
     ])
+
+
+def main_reply_keyboard():
+    """Pastki, doimiy Telegram klaviaturasi — asosiy xizmatlar."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👤 Hisobim"), KeyboardButton(text="👥 Referal havolam")],
+            [KeyboardButton(text="👑 VIP sotib olish"), KeyboardButton(text="❓ VIP nima?")],
+            [KeyboardButton(text="💰 Hisob to'ldirish")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Kerakli bo'limni tanlang..."
+    )
 
 
 def search_menu():
@@ -412,10 +427,11 @@ async def start(message: Message, state: FSMContext):
     if int(message.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
         return await message.answer("⛔ Siz botdan foydalanishdan chetlatilgansiz.")
     if not is_vip(message.from_user.id, data) and not await check_subscription(message.from_user.id):
-        return await message.answer(
+        await message.answer(
             "🔒 <b>Botdan foydalanishdan oldin majburiy kanallarga obuna bo'ling.</b>",
             reply_markup=subscription_keyboard()
         )
+        return await message.answer("📌 Asosiy menyu", reply_markup=main_reply_keyboard())
     await process_referral_reward(message.from_user.id)
     await send_start(message)
 
@@ -732,6 +748,7 @@ async def home(call: CallbackQuery, state: FSMContext):
         await call.message.edit_text(data["start_text"], reply_markup=main_menu())
     except Exception:
         await call.message.answer(data["start_text"], reply_markup=main_menu())
+    await call.message.answer("📌 Asosiy menyu", reply_markup=main_reply_keyboard())
     await call.answer()
 
 
@@ -1306,6 +1323,52 @@ async def cancel_command(message: Message, state: FSMContext):
             return await message.answer(text, reply_markup=admin_menu())
         return await message.answer(text, reply_markup=main_menu())
     await message.answer("Bekor qilinadigan amal yo'q.")
+
+
+@dp.message(F.text.in_({"👤 Hisobim", "👥 Referal havolam", "👑 VIP sotib olish", "❓ VIP nima?", "💰 Hisob to'ldirish"}))
+async def main_reply_keyboard_routes(message: Message, state: FSMContext):
+    """Pastki asosiy klaviaturadagi bo'limlarni tegishli amallarga yo'naltiradi."""
+    text = (message.text or "").strip()
+    # VIP haqida, xarid va hisob to'ldirish bo'limlari majburiy obuna ekranidan ham ochiq.
+    if text in {"👤 Hisobim", "👥 Referal havolam"}:
+        if not await require_subscription_message(message) and not is_vip(message.from_user.id):
+            return
+    await state.clear()
+    data = load_data()
+    user = data.get("users", {}).get(str(message.from_user.id), {})
+
+    if text == "👤 Hisobim":
+        referrals = len(user.get("referrals", []))
+        vip_until = int(user.get("vip_until", 0) or 0)
+        vip_text = f"Faol, {fmt_date(vip_until)} gacha" if vip_until > now_ts() else "Faol emas"
+        await message.answer(
+            ("👤 <b>Hisobim</b>\n\n"
+             f"🆔 ID: <code>{message.from_user.id}</code>\n"
+             f"💰 Balans: <b>{int(user.get('balance', 0)):,}</b> so'm\n".replace(",", " ") +
+             f"👥 Referallar: <b>{referrals}</b> ta\n👑 VIP: <b>{vip_text}</b>")
+        )
+    elif text == "👥 Referal havolam":
+        me = await bot.get_me()
+        link = f"https://t.me/{me.username}?start={message.from_user.id}"
+        await message.answer(
+            f"👥 <b>Sizning referal havolangiz</b>\n\n<code>{link}</code>\n\n"
+            f"Har bir referalingiz majburiy kanallarga obuna bo'lgach hisobingizga {REFERRAL_REWARD} so'm tushadi.\n"
+            f"Referallar soni: {len(user.get('referrals', []))}"
+        )
+    elif text == "👑 VIP sotib olish":
+        await message.answer("👑 <b>VIP muddatini tanlang</b>\nHar oy 25 000 so'm. 1 oydan 6 oygacha:", reply_markup=vip_keyboard())
+    elif text == "❓ VIP nima?":
+        await message.answer(
+            "👑 <b>VIP obuna nima beradi?</b>\n\n"
+            "✅ Majburiy kanallarga obuna bo'lmasdan botdan foydalanish.\n"
+            "🎬 Yangi anime va seriallarni oddiy foydalanuvchilardan 3 kun oldin ko'rish.\n"
+            "💳 VIP narxi — har oy 25 000 so'm.\n\nVIP muddati tugashidan 1 kun oldin eslatma yuboriladi."
+        )
+    elif text == "💰 Hisob to'ldirish":
+        await message.answer(
+            f"💰 <b>Hisobni to'ldirish</b>\n\nHisobingizni to'ldirish uchun admin bilan shaxsiy yozishmada kelishing: {ADMIN_CONTACT}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", url="https://t.me/AnimBot_Admin")]])
+        )
 
 
 @dp.message()
