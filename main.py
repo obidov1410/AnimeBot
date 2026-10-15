@@ -228,8 +228,9 @@ def main_reply_keyboard():
             [KeyboardButton(text="💰 Hisob to'ldirish")],
         ],
         resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Kerakli bo'limni tanlang..."
+        one_time_keyboard=True,
+        is_persistent=False,
+        input_field_placeholder="Menyuni ochish uchun klaviatura belgisini bosing"
     )
 
 
