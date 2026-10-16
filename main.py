@@ -82,8 +82,13 @@ def save_data(data):
     )
 
 
+def is_owner(user_id: int) -> bool:
+    return bool(OWNER_ID) and user_id == OWNER_ID
+
+
 def is_admin(user_id: int) -> bool:
-    return user_id == OWNER_ID or user_id in ADMIN_IDS or user_id in load_data()["admins"]
+    # Adminlar faqat anime/qism boshqaruvini bajaradi; owner barcha huquqlarga ega.
+    return is_owner(user_id) or user_id in ADMIN_IDS or user_id in load_data().get("admins", [])
 
 
 def now_ts() -> int:
@@ -122,11 +127,9 @@ def fmt_date(timestamp: int) -> str:
 
 def account_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Hisobim", callback_data="account")],
         [InlineKeyboardButton(text="👥 Referal havolam", callback_data="referral")],
         [InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")],
         [InlineKeyboardButton(text="💰 Hisob to'ldirish", callback_data="balance_help")],
-        [InlineKeyboardButton(text="❓ VIP nima?", callback_data="vip_info")],
         [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
     ])
 
@@ -135,21 +138,21 @@ def vip_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"{months} oy — {months * VIP_MONTH_PRICE:,} so'm".replace(",", " "), callback_data=f"vip_months:{months}")]
         for months in range(1, VIP_MAX_MONTHS + 1)
-    ] + [[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="account")]])
+    ] + [[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
 
 
 def vip_confirm_keyboard(months: int):
     amount = months * VIP_MONTH_PRICE
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Tasdiqlash 1/2", callback_data=f"vip_confirm1:{months}")],
-        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="account")]
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="home")]
     ])
 
 
 def vip_second_confirm_keyboard(months: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👑 Yakuniy tasdiqlash", callback_data=f"vip_confirm2:{months}")],
-        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="account")]
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="home")]
     ])
 
 
@@ -224,7 +227,7 @@ def main_reply_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👤 Hisobim"), KeyboardButton(text="👥 Referal havolam")],
-            [KeyboardButton(text="👑 VIP sotib olish"), KeyboardButton(text="❓ VIP nima?")],
+            [KeyboardButton(text="👑 VIP sotib olish")],
             [KeyboardButton(text="💰 Hisob to'ldirish")],
         ],
         resize_keyboard=True,
@@ -243,25 +246,26 @@ def search_menu():
 
 
 def admin_menu():
+    """Oddiy admin menyusi: faqat anime va qismlarni boshqarish."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Anime qo'shish", callback_data="add_anime")],
-        [
-            InlineKeyboardButton(text="➕ Qism qo'shish", callback_data="add_episode"),
-            InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode"),
-        ],
-        [
-            InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_anime"),
-            InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="recode_anime"),
-        ],
+        [InlineKeyboardButton(text="➕ Qism qo'shish", callback_data="add_episode"),
+         InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode")],
+        [InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_anime"),
+         InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="recode_anime")],
         [InlineKeyboardButton(text="🗑 Anime o'chirish", callback_data="del_anime")],
-        [
-            InlineKeyboardButton(text="👑 Admin qo'shish", callback_data="add_admin"),
-            InlineKeyboardButton(text="🚫 Admin o'chirish", callback_data="del_admin"),
-        ],
-        [
-            InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="add_channel"),
-            InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="del_channel"),
-        ],
+    ])
+
+
+def owner_menu():
+    """Faqat egaga ko'rinadigan to'liq boshqaruv menyusi."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Anime qo'shish", callback_data="add_anime")],
+        [InlineKeyboardButton(text="➕ Qism qo'shish", callback_data="add_episode"), InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode")],
+        [InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_anime"), InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="recode_anime")],
+        [InlineKeyboardButton(text="🗑 Anime o'chirish", callback_data="del_anime")],
+        [InlineKeyboardButton(text="👑 Admin qo'shish", callback_data="add_admin"), InlineKeyboardButton(text="🚫 Admin o'chirish", callback_data="del_admin")],
+        [InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="add_channel"), InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="del_channel")],
         [InlineKeyboardButton(text="📝 /start xabarini o'zgartirish", callback_data="start_text")],
         [InlineKeyboardButton(text="👥 Obunachilarni boshqarish", callback_data="manage_users")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
@@ -479,7 +483,7 @@ async def vip_info_callback(call: CallbackQuery):
         "💳 VIP narxi — har oy 25 000 so'm.\n\nVIP muddati tugashidan 1 kun oldin eslatma yuboriladi.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")],
-            [InlineKeyboardButton(text="⬅️ Hisobim", callback_data="account")]
+            [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
         ])
     )
     await call.answer()
@@ -568,7 +572,7 @@ async def balance_help_callback(call: CallbackQuery):
 
 @dp.callback_query(F.data == "manage_users")
 async def manage_users_callback(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
+    if not is_owner(call.from_user.id):
         return await call.answer("Adminlar uchun", show_alert=True)
     await state.set_state(Form.manage_user_id)
     await call.message.answer("👥 <b>Obunachilarni boshqarish</b>\nBoshqariladigan foydalanuvchi ID sini yuboring:")
@@ -579,13 +583,16 @@ async def manage_users_callback(call: CallbackQuery, state: FSMContext):
 async def admin_home_callback(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return await call.answer("Adminlar uchun", show_alert=True)
-    await call.message.answer("👑 <b>Admin paneli</b>", reply_markup=admin_menu())
+    if is_owner(call.from_user.id):
+        await call.message.answer("👑 <b>Owner paneli</b>", reply_markup=owner_menu())
+    else:
+        await call.message.answer("🛠 <b>Admin paneli</b>", reply_markup=admin_menu())
     await call.answer()
 
 
 @dp.message(F.text.regexp(r"^/manage(?:\s+\d+)?$"))
 async def manage_user_command(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         return await message.answer("⛔ Adminlar uchun.")
     parts = (message.text or "").split()
     if len(parts) == 1:
@@ -612,7 +619,7 @@ async def show_user_management(message: Message, user_id: int):
 
 @dp.message(Form.manage_user_id)
 async def manage_user_id_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return await message.answer("⛔ Adminlar uchun.")
     try:
@@ -625,7 +632,7 @@ async def manage_user_id_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("userban:"))
 async def user_ban_callback(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if not is_owner(call.from_user.id):
         return await call.answer("Adminlar uchun", show_alert=True)
     user_id = int(call.data.split(":", 1)[1])
     data = load_data()
@@ -643,7 +650,7 @@ async def user_ban_callback(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("uservip:"))
 async def user_vip_callback(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
+    if not is_owner(call.from_user.id):
         return await call.answer("Adminlar uchun", show_alert=True)
     user_id = int(call.data.split(":", 1)[1])
     await state.set_state(Form.admin_vip_months)
@@ -654,7 +661,7 @@ async def user_vip_callback(call: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("userunvip:"))
 async def user_unvip_callback(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if not is_owner(call.from_user.id):
         return await call.answer("Adminlar uchun", show_alert=True)
     user_id = int(call.data.split(":", 1)[1])
     data = load_data()
@@ -668,7 +675,7 @@ async def user_unvip_callback(call: CallbackQuery):
 
 @dp.message(Form.admin_vip_months)
 async def admin_vip_months_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return await message.answer("⛔ Adminlar uchun.")
     try:
@@ -697,7 +704,7 @@ async def admin_vip_months_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("userbalance:"))
 async def user_balance_callback(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
+    if not is_owner(call.from_user.id):
         return await call.answer("Adminlar uchun", show_alert=True)
     user_id = int(call.data.split(":", 1)[1])
     await state.set_state(Form.admin_balance_amount)
@@ -708,7 +715,7 @@ async def user_balance_callback(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.admin_balance_amount)
 async def admin_balance_amount_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return await message.answer("⛔ Adminlar uchun.")
     try:
@@ -738,7 +745,14 @@ async def admin_balance_amount_save(message: Message, state: FSMContext):
 async def admin_command(message: Message):
     if not is_admin(message.from_user.id):
         return await message.answer("⛔ Sizda admin huquqi yo'q.")
-    await message.answer("👑 <b>Admin paneli</b>", reply_markup=admin_menu())
+    await message.answer("🛠 <b>Admin paneli</b>\nFaqat anime va qismlarni boshqarish.", reply_markup=admin_menu())
+
+
+@dp.message(Command("owner"))
+async def owner_command(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("⛔ Bu buyruq faqat bot egasi uchun.")
+    await message.answer("👑 <b>Owner paneli</b>\nBarcha boshqaruv funksiyalari.", reply_markup=owner_menu())
 
 
 @dp.callback_query(F.data == "home")
@@ -749,7 +763,6 @@ async def home(call: CallbackQuery, state: FSMContext):
         await call.message.edit_text(data["start_text"], reply_markup=main_menu())
     except Exception:
         await call.message.answer(data["start_text"], reply_markup=main_menu())
-    await call.message.answer("📌 Asosiy menyu", reply_markup=main_reply_keyboard())
     await call.answer()
 
 
@@ -1164,12 +1177,14 @@ async def recode_new(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "add_admin")
 async def add_admin_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
     await ask(call, state, Form.admin_id_add, "Admin qilinadigan foydalanuvchining Telegram ID raqamini yuboring:")
 
 
 @dp.message(Form.admin_id_add)
 async def add_admin_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     try:
@@ -1186,12 +1201,14 @@ async def add_admin_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "del_admin")
 async def del_admin_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
     await ask(call, state, Form.admin_id_del, "Adminlikdan olinadigan Telegram ID raqamini yuboring:")
 
 
 @dp.message(Form.admin_id_del)
 async def del_admin_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     try:
@@ -1210,6 +1227,8 @@ async def del_admin_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "add_channel")
 async def add_channel_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
     await ask(call, state, Form.channel_add,
         "Kanalni yuboring. Ochiq kanal: @username\n"
         "Maxfiy kanal: -100...ID | https://t.me/+taklif_havolasi\n"
@@ -1219,7 +1238,7 @@ async def add_channel_start(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.channel_add)
 async def add_channel_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     channel = (message.text or "").strip()
@@ -1244,12 +1263,14 @@ async def add_channel_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "del_channel")
 async def del_channel_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
     await ask(call, state, Form.channel_del, "O'chiriladigan kanal @username yoki ID'sini yuboring:")
 
 
 @dp.message(Form.channel_del)
 async def del_channel_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     channel = (message.text or "").strip()
@@ -1274,12 +1295,14 @@ async def del_channel_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "start_text")
 async def start_text_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Bu bo‘lim faqat bot egasi uchun.", show_alert=True)
     await ask(call, state, Form.start_text, "Yangi /start xabarini yuboring. HTML teglardan foydalanishingiz mumkin:")
 
 
 @dp.message(Form.start_text)
 async def start_text_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+    if not is_owner(message.from_user.id):
         await state.clear()
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     data = load_data()
@@ -1291,7 +1314,7 @@ async def start_text_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "stats")
 async def stats(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if not is_owner(call.from_user.id):
         return await call.answer("Adminlar uchun", show_alert=True)
     data = load_data()
     total_episodes = sum(len(a.get("episodes", {})) for a in data["animes"].values())
@@ -1326,7 +1349,7 @@ async def cancel_command(message: Message, state: FSMContext):
     await message.answer("Bekor qilinadigan amal yo'q.")
 
 
-@dp.message(F.text.in_({"👤 Hisobim", "👥 Referal havolam", "👑 VIP sotib olish", "❓ VIP nima?", "💰 Hisob to'ldirish"}))
+@dp.message(F.text.in_({"👤 Hisobim", "👥 Referal havolam", "👑 VIP sotib olish", "💰 Hisob to'ldirish"}))
 async def main_reply_keyboard_routes(message: Message, state: FSMContext):
     """Pastki asosiy klaviaturadagi bo'limlarni tegishli amallarga yo'naltiradi."""
     text = (message.text or "").strip()
@@ -1358,13 +1381,6 @@ async def main_reply_keyboard_routes(message: Message, state: FSMContext):
         )
     elif text == "👑 VIP sotib olish":
         await message.answer("👑 <b>VIP muddatini tanlang</b>\nHar oy 25 000 so'm. 1 oydan 6 oygacha:", reply_markup=vip_keyboard())
-    elif text == "❓ VIP nima?":
-        await message.answer(
-            "👑 <b>VIP obuna nima beradi?</b>\n\n"
-            "✅ Majburiy kanallarga obuna bo'lmasdan botdan foydalanish.\n"
-            "🎬 Yangi anime va seriallarni oddiy foydalanuvchilardan 3 kun oldin ko'rish.\n"
-            "💳 VIP narxi — har oy 25 000 so'm.\n\nVIP muddati tugashidan 1 kun oldin eslatma yuboriladi."
-        )
     elif text == "💰 Hisob to'ldirish":
         await message.answer(
             f"💰 <b>Hisobni to'ldirish</b>\n\nHisobingizni to'ldirish uchun admin bilan shaxsiy yozishmada kelishing: {ADMIN_CONTACT}",
