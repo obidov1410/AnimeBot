@@ -18,15 +18,26 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 # ================== SOZLAMALAR ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
-OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else 0
-# ADMIN_ID ga bitta ID yoki vergul bilan ajratilgan bir nechta ID yozish mumkin.
+# Render Environment Variables: BOT_TOKEN, OWNER_ID, ADMIN_ID.
+# Qiymatlarda bosh/oxir bo'sh joy bo'lsa tozalanadi.
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
+
+# ADMIN_ID bitta ID yoki vergul bilan ajratilgan bir nechta ID bo'lishi mumkin.
 ADMIN_IDS_RAW = os.getenv("ADMIN_ID", "").strip()
 ADMIN_IDS = []
 for _admin_value in ADMIN_IDS_RAW.split(","):
-    if _admin_value.strip().isdigit():
-        ADMIN_IDS.append(int(_admin_value.strip()))
+    _admin_value = _admin_value.strip()
+    if _admin_value.isascii() and _admin_value.isdecimal():
+        _parsed_admin = int(_admin_value)
+        if _parsed_admin > 0 and _parsed_admin not in ADMIN_IDS:
+            ADMIN_IDS.append(_parsed_admin)
+
+OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
+if OWNER_ID_RAW.isascii() and OWNER_ID_RAW.isdecimal() and int(OWNER_ID_RAW) > 0:
+    OWNER_ID = int(OWNER_ID_RAW)
+else:
+    # OWNER_ID bo'sh qolgan bo'lsa, ADMIN_ID dagi birinchi ID egasi sifatida olinadi.
+    OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
 DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
 REFERRAL_REWARD = 199
 VIP_MONTH_PRICE = 25000
@@ -38,6 +49,11 @@ CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "").strip()
 # =================================================
 
 logging.basicConfig(level=logging.INFO)
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN topilmadi. Render > Service > Environment bo'limida "
+        "BOT_TOKEN nomli variable yarating va BotFather tokenini kiriting."
+    )
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
@@ -1451,8 +1467,12 @@ async def vip_reminder_worker():
 
 
 async def main():
-    if not BOT_TOKEN or not OWNER_ID:
-        raise RuntimeError("Render Environment Variables bo'limida BOT_TOKEN va OWNER_ID ni kiriting.")
+    if not OWNER_ID:
+        raise RuntimeError(
+            "OWNER_ID topilmadi yoki noto'g'ri. Render Environment bo'limida "
+            "OWNER_ID ga Telegram raqamli user ID ni yozing (masalan, 123456789), "
+            "yoki ADMIN_ID ga kamida bitta raqamli ID kiriting. @username yozmang."
+        )
     data = load_data()
     if OWNER_ID not in data.get("admins", []):
         data.setdefault("admins", []).append(OWNER_ID)
