@@ -12,7 +12,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as TelegramInlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as TelegramInlineKeyboardButton, ReplyKeyboardRemove
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -219,7 +219,7 @@ def fmt_date(timestamp: int) -> str:
 def account_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Referal havolam", callback_data="referral")],
-        [InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")],
+        [InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
         [InlineKeyboardButton(text="💰 Hisob to'ldirish", callback_data="balance_help")],
         [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
     ])
@@ -304,38 +304,29 @@ async def notify_new_user(tg_user):
 async def send_start(message: Message, user_id=None):
     data = load_data()
     menu_user_id = int(user_id or message.from_user.id)
-    # Xabar ostida barcha bo‘limlar bir joyda turadi.
+    # Eski pastki ReplyKeyboard'ni olib tashlab, faqat inline menyudan foydalanamiz.
+    remove_msg = await message.answer("⁣", reply_markup=ReplyKeyboardRemove())
+    try:
+        await remove_msg.delete()
+    except Exception:
+        pass
     await message.answer(data["start_text"], reply_markup=main_menu(menu_user_id))
 
 
 def main_menu(user_id=None):
-    vip = bool(user_id and is_vip(user_id))
+    # Qidiruvga tegishli katalog, sevimlilar va davom ettirish ichki menyuda.
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔎 Anime va Kino izlash", callback_data="search_menu")],
-        [InlineKeyboardButton(text="📚 Animelar ro‘yxati", callback_data="list")],
-        [InlineKeyboardButton(text="🎞 Kinolar ro‘yxati", callback_data="movie_list")],
-        [InlineKeyboardButton(text=("▶️ Davom ettirish" if vip else "🔒 Davom ettirish"), callback_data="continue_watching")],
-        [InlineKeyboardButton(text=("♥️ Yoqtirganlarim" if vip else "🔒 Yoqtirganlarim"), callback_data="favorites")],
         [InlineKeyboardButton(text="👤 Hisobim", callback_data="account"), InlineKeyboardButton(text="👥 Referal", callback_data="referral")],
-        [InlineKeyboardButton(text="💰 Balans", callback_data="balance_help"), InlineKeyboardButton(text="👑 VIP", callback_data="vip_buy")],
+        [InlineKeyboardButton(text="💰 Balans", callback_data="balance_help"), InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
         [InlineKeyboardButton(text="❓ VIP o‘zi nima?", callback_data="vip_info")],
         [InlineKeyboardButton(text="📖 Qo‘llanma", callback_data="guide")],
     ])
 
 
 def main_reply_keyboard():
-    """Pastki, doimiy Telegram klaviaturasi — asosiy xizmatlar."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👤 Hisobim"), KeyboardButton(text="👥 Referal havolam")],
-            [KeyboardButton(text="👑 VIP sotib olish")],
-            [KeyboardButton(text="💰 Hisob to'ldirish")],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-        is_persistent=False,
-        input_field_placeholder="Menyuni ochish uchun klaviatura belgisini bosing"
-    )
+    """Eski pastki klaviatura endi ishlatilmaydi."""
+    return ReplyKeyboardRemove()
 
 
 def search_menu(user_id=None):
@@ -345,7 +336,7 @@ def search_menu(user_id=None):
         [InlineKeyboardButton(text="📚 Animelar ro‘yxati", callback_data="list")],
         [InlineKeyboardButton(text="🎞 Kinolar ro‘yxati", callback_data="movie_list")],
         [InlineKeyboardButton(text=("▶️ Davom ettirish" if vip else "🔒 Davom ettirish"), callback_data="continue_watching")],
-        [InlineKeyboardButton(text=("♥️ Yoqtirganlarim" if vip else "🔒 Yoqtirganlarim"), callback_data="favorites")],
+        [InlineKeyboardButton(text=("♥️ Sevimlilar" if vip else "🔒 Sevimlilar"), callback_data="favorites")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
     ])
 
@@ -563,7 +554,7 @@ def subscription_keyboard():
             label = str(chat_ref) if str(chat_ref).startswith("@") else "Maxfiy kanal"
             rows.append([InlineKeyboardButton(text=f"📢 {label}", url=invite_url)])
     rows.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")])
-    rows.append([InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")])
+    rows.append([InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -630,7 +621,10 @@ async def account_callback(call: CallbackQuery):
             f"🆔 ID: <code>{call.from_user.id}</code>\n"
             f"💰 Balans: <b>{int(user.get('balance', 0)):,}</b> so'm\n".replace(",", " ") +
             f"👥 Referallar: <b>{referrals}</b> ta\n👑 VIP: <b>{vip_text}</b>")
-    await call.message.answer(text, reply_markup=account_menu())
+    try:
+        await call.message.edit_text(text, reply_markup=account_menu())
+    except Exception:
+        await call.message.answer(text, reply_markup=account_menu())
     await call.answer()
 
 
@@ -641,18 +635,22 @@ async def referral_callback(call: CallbackQuery):
     user, _ = ensure_user(data, call.from_user)
     save_data(data)
     link = f"https://t.me/{me.username}?start={call.from_user.id}"
-    await call.message.answer(
+    text = (
         f"👥 <b>Sizning referal havolangiz</b>\n\n<code>{link}</code>\n\n"
         f"Har bir referalingiz majburiy kanallarga obuna bo'lgach hisobingizga {get_setting('referral_reward')} so'm tushadi.\n"
-        f"Referallar soni: {len(user.get('referrals', []))}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Hisobim", callback_data="account")]])
+        f"Referallar soni: {len(user.get('referrals', []))}"
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
     await call.answer()
 
 
 @dp.callback_query(F.data == "vip_info")
 async def vip_info_callback(call: CallbackQuery):
-    await call.message.answer(
+    text = (
         "👑 <b>VIP — tomoshadan ko‘proq zavq oling!</b>\n\n"
         "VIP obunasi orqali sevimli anime, serial va filmlaringizni yanada qulayroq tomosha qiling! 💎\n\n"
         "✨ <b>VIP imkoniyatlari:</b>\n\n"
@@ -661,18 +659,26 @@ async def vip_info_callback(call: CallbackQuery):
         "🔓 Majburiy kanallarga obunasiz kirish\n"
         "📤 Kontentni ulashish imkoniyati\n"
         "♥️ Sevimlilar va ▶️ Davom ettirish\n\n"
-        f"💎 VIP narxi: oyiga {int(get_setting('vip_month_price')):,} so‘m".replace(",", " "),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 VIP sotib olish", callback_data="vip_buy")],
-            [InlineKeyboardButton(text="◀️ Orqaga", callback_data="home")]
-        ])
+        f"💎 VIP narxi: oyiga {int(get_setting('vip_month_price')):,} so‘m".replace(",", " ")
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
     await call.answer()
 
 
 @dp.callback_query(F.data == "vip_buy")
 async def vip_buy_callback(call: CallbackQuery):
-    await call.message.answer(f"👑 <b>VIP muddatini tanlang</b>\nHar oy {int(get_setting('vip_month_price')):,} so'm. 1 oydan {int(get_setting('vip_max_months'))} oygacha:".replace(",", " "), reply_markup=vip_keyboard())
+    text = f"💎 <b>VIP olish</b>\nHar oy {int(get_setting('vip_month_price')):,} so'm. 1 oydan {int(get_setting('vip_max_months'))} oygacha:".replace(",", " ")
+    try:
+        await call.message.edit_text(text, reply_markup=vip_keyboard())
+    except Exception:
+        await call.message.answer(text, reply_markup=vip_keyboard())
     await call.answer()
 
 
@@ -745,7 +751,7 @@ async def balance_help_callback(call: CallbackQuery):
         f"💰 <b>Hisobni to'ldirish</b>\n\nHisobingizni to'ldirish uchun admin bilan shaxsiy yozishmada kelishing: {get_setting('admin_contact')}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", url=f"https://t.me/{str(get_setting('admin_contact')).lstrip('@')}")],
-            [InlineKeyboardButton(text="⬅️ Hisobim", callback_data="account")]
+            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]
         ])
     )
     await call.answer()
@@ -1236,7 +1242,7 @@ async def search_code(message: Message, state: FSMContext):
     if not anime:
         return await message.answer("❌ Bu kod bo'yicha anime topilmadi yoki hozircha VIP uchun ochiq.")
     if not anime_available_for_user(message.from_user.id, anime, data):
-        return await message.answer(f"⏳ Bu anime hozircha VIP foydalanuvchilar uchun ochiq. {int(get_setting('vip_early_days'))} kundan keyin hammaga ochiladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")]]))
+        return await message.answer(f"⏳ Bu anime hozircha VIP foydalanuvchilar uchun ochiq. {int(get_setting('vip_early_days'))} kundan keyin hammaga ochiladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")]]))
     await send_anime_card(message.chat.id, code, anime)
 
 
@@ -1415,7 +1421,7 @@ async def show_anime(call: CallbackQuery):
         await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling.", reply_markup=subscription_keyboard())
         return await call.answer()
     if not anime_available_for_user(call.from_user.id, data["animes"][code], data):
-        await call.message.answer(f"⏳ Bu anime {int(get_setting('vip_early_days'))} kundan keyin hammaga ochiladi. Hozir VIP foydalanuvchilar ko'ra oladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")]]))
+        await call.message.answer(f"⏳ Bu anime {int(get_setting('vip_early_days'))} kundan keyin hammaga ochiladi. Hozir VIP foydalanuvchilar ko'ra oladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")]]))
         return await call.answer()
     try:
         await call.message.edit_text("🎬 <b>Anime ochildi.</b>")
@@ -2039,7 +2045,7 @@ async def fallback(message: Message):
         if code in data["animes"]:
             anime = data["animes"][code]
             if not anime_available_for_user(message.from_user.id, anime, data):
-                await message.answer(f"⏳ Bu anime hozircha VIP foydalanuvchilar uchun ochiq. {int(get_setting('vip_early_days'))} kundan keyin hammaga ochiladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")]]))
+                await message.answer(f"⏳ Bu anime hozircha VIP foydalanuvchilar uchun ochiq. {int(get_setting('vip_early_days'))} kundan keyin hammaga ochiladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")]]))
             else:
                 await send_anime_card(message.chat.id, code, anime)
         else:
