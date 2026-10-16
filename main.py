@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import hashlib
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -61,12 +63,14 @@ dp = Dispatcher()
 def default_data():
     return {
         "admins": [OWNER_ID],
-        "start_text": "🏴‍☠️ <b>ANIME OLAMIGA XUSH KELIBSIZ!</b>\n\n🍿 Sevimli animelaringizni biz bilan tomosha qiling!\n\n🔎 Anime topish uchun quyidagi menyudan foydalaning.\n✨ <b>ANIME UZ</b>",
+        "start_text": "🍿 <b>ANIME VA KINO OLAMIGA XUSH KELIBSIZ!</b>\n\nSevimli anime va kinolaringizni qidiring, tomosha qiling va yoqtirganlaringizga saqlang.\n\n🔎 <b>Anime va Kino UZ</b>",
         "channels": [],
         "animes": {},
+        "channel_catalog": {},
         "users": {},
         "banned_users": [],
-        "referral_events": {}
+        "referral_events": {},
+        "settings": {"referral_reward": 199, "vip_month_price": 25000, "vip_max_months": 6, "vip_month_days": 30, "vip_early_days": 3, "admin_contact": "@AnimBot_Admin"}
     }
 
 
@@ -79,6 +83,10 @@ def load_data():
         data = default_data()
     for key, value in default_data().items():
         data.setdefault(key, value)
+    data.setdefault("channel_catalog", {})
+    data.setdefault("settings", {})
+    for setting_key, setting_value in default_data()["settings"].items():
+        data["settings"].setdefault(setting_key, setting_value)
     # Avvaldan saqlangan animelarni yangi qoida bo'yicha darhol ochiq qoldiramiz.
     for anime in data.get("animes", {}).values():
         anime.setdefault("created_at", 0)
@@ -89,7 +97,13 @@ def load_data():
         user.setdefault("referral_rewarded", False)
         user.setdefault("vip_until", 0)
         user.setdefault("vip_warning_sent_for", 0)
+        user.setdefault("favorites", [])
+        user.setdefault("last_watched", None)
     return data
+
+
+def get_setting(name: str):
+    return load_data().get("settings", {}).get(name, default_data()["settings"].get(name))
 
 
 def save_data(data):
@@ -126,7 +140,7 @@ def ensure_user(data, tg_user):
             "first_name": getattr(tg_user, "first_name", "") or "",
             "balance": 0, "referrals": [], "referred_by": None,
             "referral_rewarded": False, "vip_until": 0, "vip_warning_sent_for": 0,
-            "joined_at": now_ts()
+            "favorites": [], "last_watched": None, "joined_at": now_ts()
         }
     else:
         user = data["users"][uid]
@@ -151,14 +165,16 @@ def account_menu():
 
 
 def vip_keyboard():
+    price = int(get_setting("vip_month_price"))
+    max_months = int(get_setting("vip_max_months"))
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{months} oy — {months * VIP_MONTH_PRICE:,} so'm".replace(",", " "), callback_data=f"vip_months:{months}")]
-        for months in range(1, VIP_MAX_MONTHS + 1)
+        [InlineKeyboardButton(text=f"{months} oy — {months * price:,} so'm".replace(",", " "), callback_data=f"vip_months:{months}")]
+        for months in range(1, max_months + 1)
     ] + [[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
 
 
 def vip_confirm_keyboard(months: int):
-    amount = months * VIP_MONTH_PRICE
+    amount = months * int(get_setting("vip_month_price"))
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Tasdiqlash 1/2", callback_data=f"vip_confirm1:{months}")],
         [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="home")]
@@ -187,7 +203,8 @@ async def process_referral_reward(user_id: int):
     if not referrer:
         return
     user["referral_rewarded"] = True
-    referrer["balance"] = int(referrer.get("balance", 0)) + REFERRAL_REWARD
+    reward = int(data.get("settings", {}).get("referral_reward", REFERRAL_REWARD))
+    referrer["balance"] = int(referrer.get("balance", 0)) + reward
     referrer.setdefault("referrals", [])
     if int(user_id) not in [int(x) for x in referrer["referrals"]]:
         referrer["referrals"].append(int(user_id))
@@ -196,7 +213,7 @@ async def process_referral_reward(user_id: int):
         await bot.send_message(int(referrer_id),
             f"🎉 Yangi referalingiz obuna shartlarini bajardi!\n"
             f"👤 Foydalanuvchi ID: <code>{user_id}</code>\n"
-            f"💰 Hisobingizga {REFERRAL_REWARD} so'm qo'shildi.")
+            f"💰 Hisobingizga {reward} so'm qo'shildi.")
     except Exception as exc:
         logging.info("Referal xabari yuborilmadi: %s", exc)
 
@@ -233,7 +250,11 @@ async def send_start(message: Message):
 
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔎 Anime izlash", callback_data="search_menu")],
+        [InlineKeyboardButton(text="🔎 Anime va Kino izlash", callback_data="search_menu")],
+        [InlineKeyboardButton(text="📚 Animelar ro‘yxati", callback_data="list")],
+        [InlineKeyboardButton(text="🎞 Kinolar ro‘yxati", callback_data="movie_list")],
+        [InlineKeyboardButton(text="▶️ Davom ettirish", callback_data="continue_watching")],
+        [InlineKeyboardButton(text="⭐ Yoqtirganlarim", callback_data="favorites")],
         [InlineKeyboardButton(text="📖 Qo'llanma", callback_data="guide")],
     ])
 
@@ -245,6 +266,7 @@ def main_reply_keyboard():
             [KeyboardButton(text="👤 Hisobim"), KeyboardButton(text="👥 Referal havolam")],
             [KeyboardButton(text="👑 VIP sotib olish")],
             [KeyboardButton(text="💰 Hisob to'ldirish")],
+            [KeyboardButton(text="▶️ Davom ettirish"), KeyboardButton(text="⭐ Yoqtirganlarim")],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
@@ -257,6 +279,9 @@ def search_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔢 Kod bo‘yicha qidirish", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo‘yicha qidirish", callback_data="search_name")],
         [InlineKeyboardButton(text="📚 Animelar ro‘yxati", callback_data="list")],
+        [InlineKeyboardButton(text="🎞 Kinolar ro‘yxati", callback_data="movie_list")],
+        [InlineKeyboardButton(text="▶️ Davom ettirish", callback_data="continue_watching")],
+        [InlineKeyboardButton(text="⭐ Yoqtirganlarim", callback_data="favorites")],
         [InlineKeyboardButton(text="🛑 Orqaga", callback_data="home")],
     ])
 
@@ -264,7 +289,7 @@ def search_menu():
 def admin_menu():
     """Oddiy admin menyusi: faqat anime va qismlarni boshqarish."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Anime qo'shish", callback_data="add_anime")],
+        [InlineKeyboardButton(text="➕ Anime qo'shish", callback_data="add_anime"), InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="add_movie")],
         [InlineKeyboardButton(text="➕ Qism qo'shish", callback_data="add_episode"),
          InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode")],
         [InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_anime"),
@@ -276,7 +301,7 @@ def admin_menu():
 def owner_menu():
     """Faqat egaga ko'rinadigan to'liq boshqaruv menyusi."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Anime qo'shish", callback_data="add_anime")],
+        [InlineKeyboardButton(text="➕ Anime qo'shish", callback_data="add_anime"), InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="add_movie")],
         [InlineKeyboardButton(text="➕ Qism qo'shish", callback_data="add_episode"), InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode")],
         [InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_anime"), InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="recode_anime")],
         [InlineKeyboardButton(text="🗑 Anime o'chirish", callback_data="del_anime")],
@@ -285,11 +310,30 @@ def owner_menu():
         [InlineKeyboardButton(text="📝 /start xabarini o'zgartirish", callback_data="start_text")],
         [InlineKeyboardButton(text="👥 Obunachilarni boshqarish", callback_data="manage_users")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
+        [InlineKeyboardButton(text="📚 Baza kanalini sozlash", callback_data="setcfg:catalog_channel_id")],
+        [InlineKeyboardButton(text="⚙️ Bot sozlamalari", callback_data="owner_settings")],
     ])
 
 
-def episode_keyboard(code: str, episodes: dict):
-    """Qism raqamlarini ixcham 5 ustunli jadvalda chiqaradi."""
+def normalize_media_title(value: str) -> str:
+    """Sarlavhani kanal captioni va botdagi anime nomi bilan solishtirish uchun normallashtiradi."""
+    value = re.sub(r"#\w+", " ", value or "", flags=re.UNICODE)
+    value = re.sub(r"^(nom|title|kino|anime)\s*:\s*", "", value.strip(), flags=re.I)
+    return " ".join(value.casefold().split()).strip(" .-–—:")
+
+
+def catalog_item_for_anime(data: dict, anime: dict):
+    target = normalize_media_title(anime.get("name", ""))
+    if not target:
+        return None, None
+    for key, item in data.get("channel_catalog", {}).items():
+        if normalize_media_title(item.get("name", "")) == target:
+            return key, item
+    return None, None
+
+
+def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=None):
+    """Bot ichida qo'shilgan qismlar va baza kanaldagi qismlarni bir xil menyuda ko'rsatadi."""
     rows, row = [], []
     def sort_key(value):
         return (0, int(value)) if str(value).isdigit() else (1, str(value))
@@ -300,13 +344,23 @@ def episode_keyboard(code: str, episodes: dict):
             row = []
     if row:
         rows.append(row)
+    if catalog_key and catalog_item:
+        for number in sorted(catalog_item.get("parts", {}), key=sort_key):
+            row.append(InlineKeyboardButton(text=f"▶️ {number}", callback_data=f"catalog_part:{catalog_key}:{number}"))
+            if len(row) == 5:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+    rows.append([InlineKeyboardButton(text="⭐ Yoqtirganlarga qo‘shish", callback_data=f"favorite_add:{code}")])
     rows.append([InlineKeyboardButton(text="🛑 Orqaga", callback_data="search_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def anime_caption(code: str, anime: dict) -> str:
     description = (anime.get("description") or "").strip()
-    base = f"🎬 <b>{anime['name']}</b>\n\n🔢 Anime kodi: <code>{code}</code>\n🎞 Qismlar: {len(anime.get('episodes', {}))}"
+    kind = "🎞 Kino" if anime.get("media_type") == "movie" else "🍥 Anime"
+    base = f"{kind}: <b>{anime['name']}</b>\n\n🔢 Kod: <code>{code}</code>\n🎞 Qismlar/video: {len(anime.get('episodes', {}))}"
     if description:
         base += "\n\n" + description
     return base[:1024]
@@ -317,12 +371,17 @@ def anime_available_for_user(user_id: int, anime: dict, data=None) -> bool:
     if is_admin(user_id) or is_vip(user_id, data):
         return True
     created_at = int(anime.get("created_at", 0) or 0)
-    return created_at == 0 or now_ts() >= created_at + 3 * 24 * 60 * 60
+    return created_at == 0 or now_ts() >= created_at + int((data or load_data()).get("settings", {}).get("vip_early_days", 3)) * 24 * 60 * 60
 
 
 async def send_anime_card(chat_id: int, code: str, anime: dict):
+    data = load_data()
+    catalog_key, catalog_item = catalog_item_for_anime(data, anime)
+    catalog_count = len(catalog_item.get("parts", {})) if catalog_item else 0
     caption = anime_caption(code, anime)
-    markup = episode_keyboard(code, anime.get("episodes", {}))
+    if catalog_count:
+        caption = caption.replace(f"🎞 Qismlar/video: {len(anime.get('episodes', {}))}", f"🎞 Qismlar/video: {len(anime.get('episodes', {})) + catalog_count}")
+    markup = episode_keyboard(code, anime.get("episodes", {}), catalog_key, catalog_item)
     poster = anime.get("poster_file_id")
     if poster:
         await bot.send_photo(chat_id, poster, caption=caption, reply_markup=markup)
@@ -353,6 +412,7 @@ class Form(StatesGroup):
     manage_user_id = State()
     admin_vip_months = State()
     admin_balance_amount = State()
+    owner_setting_value = State()
 
 
 def parse_channel_entry(entry):
@@ -442,7 +502,7 @@ async def start(message: Message, state: FSMContext):
         try:
             await bot.send_message(referrer_id,
                 f"👥 Sizning referal havolangiz orqali yangi foydalanuvchi keldi (ID: <code>{message.from_user.id}</code>).\n"
-                f"💰 {REFERRAL_REWARD} so'm mukofot majburiy kanallarga obuna bo'lgach beriladi.")
+                f"💰 {get_setting('referral_reward')} so'm mukofot majburiy kanallarga obuna bo'lgach beriladi.")
         except Exception as exc:
             logging.info("Referal kirish xabari yuborilmadi: %s", exc)
     if int(message.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
@@ -483,7 +543,7 @@ async def referral_callback(call: CallbackQuery):
     link = f"https://t.me/{me.username}?start={call.from_user.id}"
     await call.message.answer(
         f"👥 <b>Sizning referal havolangiz</b>\n\n<code>{link}</code>\n\n"
-        f"Har bir referalingiz majburiy kanallarga obuna bo'lgach hisobingizga {REFERRAL_REWARD} so'm tushadi.\n"
+        f"Har bir referalingiz majburiy kanallarga obuna bo'lgach hisobingizga {get_setting('referral_reward')} so'm tushadi.\n"
         f"Referallar soni: {len(user.get('referrals', []))}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Hisobim", callback_data="account")]])
     )
@@ -495,8 +555,8 @@ async def vip_info_callback(call: CallbackQuery):
     await call.message.answer(
         "👑 <b>VIP obuna nima beradi?</b>\n\n"
         "✅ Majburiy kanallarga obuna bo'lmasdan botdan foydalanish.\n"
-        "🎬 Yangi anime va seriallarni oddiy foydalanuvchilardan 3 kun oldin ko'rish.\n"
-        "💳 VIP narxi — har oy 25 000 so'm.\n\nVIP muddati tugashidan 1 kun oldin eslatma yuboriladi.",
+        f"🎬 Yangi anime va kinolarni oddiy foydalanuvchilardan {int(get_setting('vip_early_days'))} kun oldin ko'rish.\n"
+        f"💳 VIP narxi — har oy {int(get_setting('vip_month_price')):,} so'm.\n\nVIP muddati tugashidan 1 kun oldin eslatma yuboriladi.".replace(",", " "),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")],
             [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
@@ -507,7 +567,7 @@ async def vip_info_callback(call: CallbackQuery):
 
 @dp.callback_query(F.data == "vip_buy")
 async def vip_buy_callback(call: CallbackQuery):
-    await call.message.answer("👑 <b>VIP muddatini tanlang</b>\nHar oy 25 000 so'm. 1 oydan 6 oygacha:", reply_markup=vip_keyboard())
+    await call.message.answer(f"👑 <b>VIP muddatini tanlang</b>\nHar oy {int(get_setting('vip_month_price')):,} so'm. 1 oydan {int(get_setting('vip_max_months'))} oygacha:".replace(",", " "), reply_markup=vip_keyboard())
     await call.answer()
 
 
@@ -517,9 +577,9 @@ async def vip_months_callback(call: CallbackQuery):
         months = int(call.data.split(":", 1)[1])
     except ValueError:
         return await call.answer("Noto'g'ri muddat", show_alert=True)
-    if months < 1 or months > VIP_MAX_MONTHS:
+    if months < 1 or months > int(get_setting("vip_max_months")):
         return await call.answer("VIP muddati 1–6 oy bo'lishi kerak", show_alert=True)
-    amount = months * VIP_MONTH_PRICE
+    amount = months * int(get_setting("vip_month_price"))
     await call.message.answer(
         f"Siz {months} oylik VIP obunani tanladingiz.\nNarxi: <b>{amount:,}</b> so'm.\n\n"
         "Davom etish uchun birinchi marta tasdiqlang.".replace(",", " "),
@@ -531,9 +591,9 @@ async def vip_months_callback(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("vip_confirm1:"))
 async def vip_confirm1_callback(call: CallbackQuery):
     months = int(call.data.split(":", 1)[1])
-    if months < 1 or months > VIP_MAX_MONTHS:
+    if months < 1 or months > int(get_setting("vip_max_months")):
         return await call.answer("Noto'g'ri muddat", show_alert=True)
-    amount = months * VIP_MONTH_PRICE
+    amount = months * int(get_setting("vip_month_price"))
     data = load_data()
     user = data.get("users", {}).get(str(call.from_user.id), {})
     balance = int(user.get("balance", 0))
@@ -550,11 +610,11 @@ async def vip_confirm1_callback(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("vip_confirm2:"))
 async def vip_confirm2_callback(call: CallbackQuery):
     months = int(call.data.split(":", 1)[1])
-    if months < 1 or months > VIP_MAX_MONTHS:
+    if months < 1 or months > int(get_setting("vip_max_months")):
         return await call.answer("Noto'g'ri muddat", show_alert=True)
     data = load_data()
     user = data.get("users", {}).get(str(call.from_user.id))
-    amount = months * VIP_MONTH_PRICE
+    amount = months * int(get_setting("vip_month_price"))
     if not user:
         return await call.answer("Hisob topilmadi. /start bosing.", show_alert=True)
     if int(user.get("balance", 0)) < amount:
@@ -567,7 +627,7 @@ async def vip_confirm2_callback(call: CallbackQuery):
     user["vip_pending_until"] = 0
     user["balance"] = int(user.get("balance", 0)) - amount
     start_at = max(now_ts(), int(user.get("vip_until", 0) or 0))
-    user["vip_until"] = start_at + months * VIP_MONTH_DAYS * 24 * 60 * 60
+    user["vip_until"] = start_at + months * int(get_setting("vip_month_days")) * 24 * 60 * 60
     user["vip_warning_sent_for"] = 0
     save_data(data)
     await call.message.answer(f"✅ VIP muvaffaqiyatli faollashtirildi!\n📅 Tugash vaqti: {fmt_date(user['vip_until'])}\n💰 Yechilgan summa: {amount:,} so'm".replace(",", " "), reply_markup=account_menu())
@@ -577,13 +637,93 @@ async def vip_confirm2_callback(call: CallbackQuery):
 @dp.callback_query(F.data == "balance_help")
 async def balance_help_callback(call: CallbackQuery):
     await call.message.answer(
-        f"💰 <b>Hisobni to'ldirish</b>\n\nHisobingizni to'ldirish uchun admin bilan shaxsiy yozishmada kelishing: {ADMIN_CONTACT}",
+        f"💰 <b>Hisobni to'ldirish</b>\n\nHisobingizni to'ldirish uchun admin bilan shaxsiy yozishmada kelishing: {get_setting('admin_contact')}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", url="https://t.me/AnimBot_Admin")],
+            [InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", url=f"https://t.me/{str(get_setting('admin_contact')).lstrip('@')}")],
             [InlineKeyboardButton(text="⬅️ Hisobim", callback_data="account")]
         ])
     )
     await call.answer()
+
+
+@dp.callback_query(F.data == "owner_settings")
+async def owner_settings_callback(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    cfg = load_data().get("settings", {})
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"👥 Referal mukofoti: {cfg.get('referral_reward', 199)} so'm", callback_data="setcfg:referral_reward")],
+        [InlineKeyboardButton(text=f"👑 VIP 1 oy narxi: {cfg.get('vip_month_price', 25000)} so'm", callback_data="setcfg:vip_month_price")],
+        [InlineKeyboardButton(text=f"📆 VIP maksimal muddat: {cfg.get('vip_max_months', 6)} oy", callback_data="setcfg:vip_max_months")],
+        [InlineKeyboardButton(text=f"⏳ VIP oy davomiyligi: {cfg.get('vip_month_days', 30)} kun", callback_data="setcfg:vip_month_days")],
+        [InlineKeyboardButton(text=f"🎬 Erta ko'rish: {cfg.get('vip_early_days', 3)} kun", callback_data="setcfg:vip_early_days")],
+        [InlineKeyboardButton(text=f"💬 To'lov admini: {cfg.get('admin_contact', '@AnimBot_Admin')}", callback_data="setcfg:admin_contact")],
+        [InlineKeyboardButton(text=f"📚 Baza kanali: {cfg.get('catalog_channel_id', 'sozlanmagan')}", callback_data="setcfg:catalog_channel_id")],
+        [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
+    ])
+    await call.message.answer("⚙️ <b>Bot sozlamalari</b>\nBu yerdagi o'zgarishlar data.json fayliga saqlanadi; kodni o'zgartirish yoki redeploy qilish shart emas.\n\nO'zgartirmoqchi bo'lgan sozlamani tanlang:", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("setcfg:"))
+async def owner_setting_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    key = call.data.split(":", 1)[1]
+    prompts = {
+        "referral_reward": "Har bir muvaffaqiyatli referal uchun beriladigan mukofotni so'mda yuboring:",
+        "vip_month_price": "VIPning 1 oylik narxini so'mda yuboring:",
+        "vip_max_months": "Sotib olish mumkin bo'lgan maksimal VIP oy sonini yuboring (1–24):",
+        "vip_month_days": "VIP hisobida bir oy necha kun bo'lishini yuboring (1–365):",
+        "vip_early_days": "Yangi anime/kino VIP uchun necha kun oldin ochilishini yuboring (0–30):",
+        "admin_contact": "To'lov uchun admin username yuboring, masalan @AnimBot_Admin:",
+        "catalog_channel_id": "Baza kanalining @username yoki -100... ko'rinishidagi ID sini yuboring. Bot o'sha kanalga ADMIN bo'lishi shart. Masalan @my_movies yoki -1001234567890:"
+    }
+    if key not in prompts:
+        return await call.answer("Noma'lum sozlama", show_alert=True)
+    await state.set_state(Form.owner_setting_value)
+    await state.update_data(setting_key=key)
+    await call.message.answer("⚙️ " + prompts[key] + "\nBekor qilish: /cancel")
+    await call.answer()
+
+
+@dp.message(Form.owner_setting_value)
+async def owner_setting_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Faqat owner uchun.")
+    if (message.text or "").strip() == "/cancel":
+        await state.clear()
+        return await message.answer("Bekor qilindi.", reply_markup=owner_menu())
+    saved = await state.get_data()
+    key = saved.get("setting_key")
+    raw = (message.text or "").strip()
+    limits = {"referral_reward": (0, 1000000000), "vip_month_price": (0, 1000000000), "vip_max_months": (1, 24), "vip_month_days": (1, 365), "vip_early_days": (0, 30)}
+    if key in limits:
+        try:
+            value = int(raw)
+        except ValueError:
+            return await message.answer("Faqat raqam yuboring:")
+        low, high = limits[key]
+        if not low <= value <= high:
+            return await message.answer(f"Qiymat {low} dan {high} gacha bo'lishi kerak. Qayta yuboring:")
+    elif key == "admin_contact":
+        value = raw
+        if not value.startswith("@") or len(value) < 2 or " " in value:
+            return await message.answer("Username @ bilan boshlansin, masalan @AnimBot_Admin. Qayta yuboring:")
+    elif key == "catalog_channel_id":
+        value = raw
+        if not ((value.startswith("@") and len(value) > 1 and " " not in value) or (value.startswith("-100") and value[1:].isdigit())):
+            return await message.answer("Kanal @username yoki -100... ID ko'rinishida bo'lsin. Qayta yuboring:")
+    else:
+        await state.clear()
+        return await message.answer("Sozlama topilmadi.")
+    data = load_data()
+    data.setdefault("settings", {})[key] = value
+    save_data(data)
+    await state.clear()
+    labels = {"referral_reward": "Referal mukofoti", "vip_month_price": "VIP 1 oy narxi", "vip_max_months": "VIP maksimal muddati", "vip_month_days": "VIP oy davomiyligi", "vip_early_days": "VIP erta ochilish muddati", "admin_contact": "To'lov admini", "catalog_channel_id": "Baza kanali"}
+    await message.answer(f"✅ {labels[key]} yangilandi: <b>{value}{' so\'m' if key in ('referral_reward', 'vip_month_price') else ''}</b>\nO'zgarish darhol kuchga kirdi.", reply_markup=owner_menu())
 
 
 @dp.callback_query(F.data == "manage_users")
@@ -707,7 +847,7 @@ async def admin_vip_months_save(message: Message, state: FSMContext):
     if not user:
         await state.clear()
         return await message.answer("Foydalanuvchi topilmadi.")
-    user["vip_until"] = max(now_ts(), int(user.get("vip_until", 0) or 0)) + months * VIP_MONTH_DAYS * 24 * 60 * 60
+    user["vip_until"] = max(now_ts(), int(user.get("vip_until", 0) or 0)) + months * int(get_setting("vip_month_days")) * 24 * 60 * 60
     user["vip_warning_sent_for"] = 0
     save_data(data)
     await state.clear()
@@ -785,21 +925,133 @@ async def home(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "search_menu")
 async def search_menu_open(call: CallbackQuery):
     try:
-        await call.message.edit_text("🔎 <b>Anime izlash</b>\n\nKerakli usulni tanlang:", reply_markup=search_menu())
+        await call.message.edit_text("🔎 <b>Anime va Kino izlash</b>\n\nKod yoki nom orqali qidiring, ro‘yxatlardan foydalaning:", reply_markup=search_menu())
     except Exception:
-        await call.message.answer("🔎 <b>Anime izlash</b>\n\nKerakli usulni tanlang:", reply_markup=search_menu())
+        await call.message.answer("🔎 <b>Anime va Kino izlash</b>\n\nKod yoki nom orqali qidiring, ro‘yxatlardan foydalaning:", reply_markup=search_menu())
     await call.answer()
 
 
 @dp.callback_query(F.data == "guide")
 async def guide(call: CallbackQuery):
-    text = "📖 <b>Qo'llanma</b>\n\n1️⃣ Anime izlashni bosing.\n2️⃣ 🔢 Kod bo‘yicha qidirish, 🔠 Nom bo‘yicha qidirish yoki 📚 Animelar ro‘yxatini tanlang.\n3️⃣ Anime sahifasidan kerakli qism raqamini bosing.\n\n🛑 Orqaga tugmasi oldingi menyuga qaytaradi."
+    text = "📖 <b>Qo'llanma</b>\n\n1️⃣ Anime va Kino izlashni bosing.\n2️⃣ Kod yoki nom orqali qidiring, Animelar/Kinolar ro‘yxatini oching.\n3️⃣ Kerakli anime qismi yoki kino videosini bosing. Yoqtirganlarga saqlang va Davom ettirish orqali qayting.\n\n🛑 Orqaga tugmasi oldingi menyuga qaytaradi."
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛑 Orqaga", callback_data="home")]])
     try:
         await call.message.edit_text(text, reply_markup=kb)
     except Exception:
         await call.message.answer(text, reply_markup=kb)
     await call.answer()
+
+
+def _catalog_key(text: str, tags: list[str]) -> str:
+    # #1, #2 kabi raqamli teglar qism raqami; qolgan teglar guruh identifikatori.
+    identity = next((tag.casefold() for tag in tags if not tag.isdigit()), "")
+    if not identity:
+        identity = re.sub(r"#\w+", " ", text.splitlines()[0] if text else "")
+        identity = re.sub(r"^(nom|title|kino|anime)\s*:\s*", "", identity, flags=re.I)
+        identity = " ".join(identity.casefold().split())
+    return hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12] if identity else ""
+
+
+@dp.channel_post()
+async def index_storage_channel_post(message: Message):
+    """Baza kanali postlarini avtomatik indekslaydi. Bot kanal admini bo'lishi kerak."""
+    data = load_data()
+    configured = str(data.get("settings", {}).get("catalog_channel_id", CHANNEL_ID) or "").strip()
+    if not configured:
+        return
+    if configured.startswith("@"):
+        if (message.chat.username or "").casefold() != configured[1:].casefold():
+            return
+    elif str(message.chat.id) != configured:
+        return
+
+    text = (message.caption or message.text or "").strip()
+    if not text:
+        return
+    tags = re.findall(r"#([\w]+)", text, flags=re.UNICODE)
+    part_tag = next((tag for tag in tags if tag.isdigit()), None)
+    key = _catalog_key(text, tags)
+    if not key:
+        return
+
+    item = data.setdefault("channel_catalog", {}).setdefault(key, {
+        "name": "", "description": "", "search_text": "", "parts": {}, "updated_at": now_ts()
+    })
+    clean_lines = [re.sub(r"#([\w]+)", "", line).strip(" \t-|:") for line in text.splitlines()]
+    clean_lines = [line for line in clean_lines if line]
+    title = clean_lines[0] if clean_lines else ""
+    if part_tag:
+        if not title:
+            title = item.get("name") or "Nomsiz kino"
+        item["name"] = item.get("name") or title
+        item.setdefault("parts", {})[str(int(part_tag))] = {"chat_id": message.chat.id, "message_id": message.message_id}
+        item["search_text"] = (item.get("search_text", "") + " " + text).casefold()
+    else:
+        # Qism raqami bo'lmagan post kino/anime ma'lumoti deb olinadi.
+        if title:
+            item["name"] = title
+        description = "\n".join(clean_lines[1:]).strip()
+        if description:
+            item["description"] = description
+        item["info_chat_id"] = message.chat.id
+        item["info_message_id"] = message.message_id
+        item["search_text"] = (item.get("search_text", "") + " " + text).casefold()
+    item["updated_at"] = now_ts()
+    save_data(data)
+    logging.info("Catalog indexed: channel=%s title=%s part=%s", message.chat.id, item.get("name"), part_tag or "info")
+
+
+@dp.callback_query(F.data.startswith("catalog_show:"))
+async def catalog_show(call: CallbackQuery):
+    data = load_data()
+    key = call.data.split(":", 1)[1]
+    item = data.get("channel_catalog", {}).get(key)
+    if not item:
+        return await call.answer("Bu kino bazada topilmadi.", show_alert=True)
+    if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
+        return await call.answer("Botdan foydalanish taqiqlangan.", show_alert=True)
+    if not is_vip(call.from_user.id, data) and not await check_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling.", reply_markup=subscription_keyboard())
+        return await call.answer()
+    parts = item.get("parts", {})
+    rows, row = [], []
+    for number in sorted(parts, key=lambda value: int(value) if str(value).isdigit() else 999999):
+        row.append(InlineKeyboardButton(text=f"▶️ {number}-qism", callback_data=f"catalog_part:{key}:{number}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ Qidiruvga qaytish", callback_data="search_menu")])
+    description = item.get("description", "")
+    caption = f"🎬 <b>{item.get('name', 'Nomsiz kino')}</b>\n\n{description}\n\n📼 Qismlar: {len(parts)} ta"[:3900]
+    await call.message.answer(caption, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("catalog_part:"))
+async def catalog_send_part(call: CallbackQuery):
+    data = load_data()
+    try:
+        _, key, number = call.data.split(":", 2)
+        item = data["channel_catalog"][key]
+        part = item["parts"][number]
+    except (KeyError, ValueError):
+        return await call.answer("Qism topilmadi.", show_alert=True)
+    if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
+        return await call.answer("Botdan foydalanish taqiqlangan.", show_alert=True)
+    if not is_vip(call.from_user.id, data) and not await check_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling.", reply_markup=subscription_keyboard())
+        return await call.answer()
+    user = data.setdefault("users", {}).setdefault(str(call.from_user.id), {})
+    matched_code = next((code for code, anime in data.get("animes", {}).items() if normalize_media_title(anime.get("name", "")) == normalize_media_title(item.get("name", ""))), None)
+    user["last_watched"] = {"catalog_key": key, "code": matched_code, "number": number, "media_type": "movie", "updated_at": now_ts()}
+    save_data(data)
+    try:
+        await bot.copy_message(chat_id=call.from_user.id, from_chat_id=part["chat_id"], message_id=part["message_id"])
+        await call.answer(f"{number}-qism yuborildi")
+    except Exception:
+        logging.exception("Catalog part copy failed")
+        await call.answer("Qism yuborilmadi. Botning kanal adminligi va postni tekshiring.", show_alert=True)
 
 
 @dp.callback_query(F.data == "search_name")
@@ -817,11 +1069,14 @@ async def search_name_result(message: Message, state: FSMContext):
     query = (message.text or "").strip().casefold()
     data = load_data()
     matches = [(code, anime) for code, anime in data["animes"].items() if query in anime["name"].casefold() and anime_available_for_user(message.from_user.id, anime, data)]
-    if not matches:
-        return await message.answer("❌ Bu nom bo'yicha anime topilmadi.", reply_markup=search_menu())
-    rows = [[InlineKeyboardButton(text=f"🎬 {anime['name']} · {code}", callback_data=f"show:{code}")] for code, anime in matches[:80]]
+    catalog_matches = [(key, item) for key, item in data.get("channel_catalog", {}).items() if query and (query in item.get("name", "").casefold() or query in item.get("search_text", "").casefold())]
+    if not matches and not catalog_matches:
+        return await message.answer("❌ Bu nom bo'yicha anime yoki kino topilmadi.", reply_markup=search_menu())
+    rows = [[InlineKeyboardButton(text=f"{'🎞' if anime.get('media_type') == 'movie' else '🍥'} {anime['name']} · {code}", callback_data=f"show:{code}")] for code, anime in matches[:40]]
+    registered_titles = {normalize_media_title(anime.get("name", "")) for _, anime in matches}
+    rows += [[InlineKeyboardButton(text=f"🎬 {item.get('name', 'Nomsiz')} · baza", callback_data=f"catalog_show:{key}")] for key, item in catalog_matches[:40] if normalize_media_title(item.get("name", "")) not in registered_titles]
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
-    await message.answer("🔎 <b>Topilgan animelar</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await message.answer("🔎 <b>Topilgan anime va kinolar</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @dp.callback_query(F.data == "search")
@@ -842,7 +1097,7 @@ async def search_code(message: Message, state: FSMContext):
     if not anime:
         return await message.answer("❌ Bu kod bo'yicha anime topilmadi yoki hozircha VIP uchun ochiq.")
     if not anime_available_for_user(message.from_user.id, anime, data):
-        return await message.answer("⏳ Bu anime hozircha VIP foydalanuvchilar uchun ochiq. 3 kundan keyin hammaga ochiladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")]]))
+        return await message.answer(f"⏳ Bu anime hozircha VIP foydalanuvchilar uchun ochiq. {int(get_setting('vip_early_days'))} kundan keyin hammaga ochiladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")]]))
     await send_anime_card(message.chat.id, code, anime)
 
 
@@ -864,6 +1119,9 @@ async def send_episode(call: CallbackQuery):
             await call.answer("Bu anime hozircha VIP uchun ochiq.", show_alert=True)
             return
         episode = anime["episodes"][number]
+        user = current_data.setdefault("users", {}).setdefault(str(call.from_user.id), {})
+        user["last_watched"] = {"code": code, "number": number, "media_type": anime.get("media_type", "anime"), "updated_at": now_ts()}
+        save_data(current_data)
         source_chat = episode["chat_id"]
         source_message = episode["message_id"]
         await bot.copy_message(
@@ -887,12 +1145,80 @@ async def anime_list(call: CallbackQuery):
     if not data["animes"]:
         await call.message.answer("📭 Hozircha anime qo'shilmagan.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")]]))
     else:
-        visible_animes = [(code, a) for code, a in data["animes"].items() if anime_available_for_user(call.from_user.id, a, data)]
+        visible_animes = [(code, a) for code, a in data["animes"].items() if a.get("media_type", "anime") != "movie" and anime_available_for_user(call.from_user.id, a, data)]
         rows = [[InlineKeyboardButton(text=f"🎬 {a['name']} · {code}", callback_data=f"show:{code}")]
                 for code, a in visible_animes[:80]]
         rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
         await call.message.answer("📚 <b>Barcha animelar</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
+
+
+@dp.callback_query(F.data == "movie_list")
+async def movie_list(call: CallbackQuery):
+    data = load_data()
+    if not is_vip(call.from_user.id, data) and not await check_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo‘ling.", reply_markup=subscription_keyboard())
+        return await call.answer()
+    items = [(code, item) for code, item in data.get("animes", {}).items() if item.get("media_type") == "movie" and anime_available_for_user(call.from_user.id, item, data)]
+    rows = [[InlineKeyboardButton(text=f"🎞 {item['name']} · {code}", callback_data=f"show:{code}")] for code, item in items[:80]]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
+    await call.message.answer("🎞 <b>Kinolar ro‘yxati</b>" if items else "📭 Hozircha kino qo‘shilmagan.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("favorite_add:"))
+async def favorite_add(call: CallbackQuery):
+    code = call.data.split(":", 1)[1]
+    data = load_data()
+    if code not in data.get("animes", {}):
+        return await call.answer("Topilmadi", show_alert=True)
+    user = data.setdefault("users", {}).setdefault(str(call.from_user.id), {"id": call.from_user.id, "favorites": []})
+    favs = user.setdefault("favorites", [])
+    if code in favs:
+        favs.remove(code)
+        msg = "Sevimlilardan olib tashlandi"
+    else:
+        favs.append(code)
+        msg = "Yoqtirganlaringizga saqlandi ⭐"
+    save_data(data)
+    await call.answer(msg, show_alert=True)
+
+
+@dp.callback_query(F.data == "favorites")
+async def favorites_list(call: CallbackQuery):
+    data = load_data()
+    user = data.get("users", {}).get(str(call.from_user.id), {})
+    codes = user.get("favorites", [])
+    rows = []
+    for code in codes:
+        item = data.get("animes", {}).get(str(code))
+        if item:
+            icon = "🎞" if item.get("media_type") == "movie" else "🍥"
+            rows.append([InlineKeyboardButton(text=f"{icon} {item['name']} · {code}", callback_data=f"show:{code}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
+    await call.message.answer("⭐ <b>Yoqtirganlarim</b>" if len(rows) > 1 else "⭐ Hozircha saqlangan narsa yo‘q.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "continue_watching")
+async def continue_watching(call: CallbackQuery):
+    data = load_data()
+    user = data.get("users", {}).get(str(call.from_user.id), {})
+    last = user.get("last_watched") or {}
+    code = str(last.get("code", ""))
+    item = data.get("animes", {}).get(code)
+    if item:
+        await send_anime_card(call.from_user.id, code, item)
+        await call.answer("Davom ettirish uchun kerakli qismni bosing")
+    elif last.get("catalog_key") in data.get("channel_catalog", {}):
+        key = last["catalog_key"]
+        catalog_item = data["channel_catalog"][key]
+        parts = catalog_item.get("parts", {})
+        rows = [[InlineKeyboardButton(text=f"▶️ {number}-qism", callback_data=f"catalog_part:{key}:{number}")] for number in sorted(parts, key=lambda value: int(value) if str(value).isdigit() else 999999)]
+        await call.message.answer(f"🎬 <b>{catalog_item.get('name', 'Nomsiz')}</b>\n\n{catalog_item.get('description', '')}", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await call.answer("Oxirgi ko‘rilgan kino topildi")
+    else:
+        await call.answer("Hali tomosha qilgan narsangiz yo‘q.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("show:"))
@@ -907,7 +1233,7 @@ async def show_anime(call: CallbackQuery):
         await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling.", reply_markup=subscription_keyboard())
         return await call.answer()
     if not anime_available_for_user(call.from_user.id, data["animes"][code], data):
-        await call.message.answer("⏳ Bu anime 3 kundan keyin hammaga ochiladi. Hozir VIP foydalanuvchilar ko'ra oladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")]]))
+        await call.message.answer(f"⏳ Bu anime {int(get_setting('vip_early_days'))} kundan keyin hammaga ochiladi. Hozir VIP foydalanuvchilar ko'ra oladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")]]))
         return await call.answer()
     try:
         await call.message.edit_text("🎬 <b>Anime ochildi.</b>")
@@ -933,6 +1259,16 @@ async def add_anime(call: CallbackQuery, state: FSMContext):
     await ask(call, state, Form.anime_code, "🔢 Yangi anime uchun unikal kod yuboring:")
 
 
+@dp.callback_query(F.data == "add_movie")
+async def add_movie(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔ Adminlar uchun.", show_alert=True)
+    await state.update_data(media_type="movie")
+    await state.set_state(Form.anime_code)
+    await call.message.answer("🔢 Yangi kino uchun takrorlanmaydigan kod yuboring:")
+    await call.answer()
+
+
 @dp.message(Form.anime_code)
 async def anime_code(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -944,7 +1280,8 @@ async def anime_code(message: Message, state: FSMContext):
         return await message.answer("❌ Kod bo'sh yoki band. Boshqa kod yuboring:")
     await state.update_data(new_code=code)
     await state.set_state(Form.anime_name)
-    await message.answer("🎬 Anime nomini yuboring:")
+    saved = await state.get_data()
+    await message.answer("🎞 Kino nomini yuboring:" if saved.get("media_type") == "movie" else "🍥 Anime nomini yuboring:")
 
 
 @dp.message(Form.anime_name)
@@ -984,17 +1321,20 @@ async def anime_info(message: Message, state: FSMContext):
         description = message.text.strip()
     else:
         return await message.answer("Rasm yoki matn yuboring, yoki /skip bosing.")
-    data["animes"][code] = {"name": name, "description": description, "poster_file_id": poster, "episodes": {}, "created_at": now_ts()}
+    media_type = saved.get("media_type", "anime")
+    data["animes"][code] = {"name": name, "description": description, "poster_file_id": poster, "episodes": {}, "created_at": now_ts(), "media_type": media_type}
     save_data(data)
-    await state.update_data(batch_code=code, batch_count=0)
-    await state.set_state(Form.episode_batch)
-    prompt = await message.answer(
-        f"✅ <b>{name}</b> (kod <code>{code}</code>) yaratildi.\n\n"
-        "Endi barcha qismlarni kanal postlaridan <b>1, 2, 3...</b> tartibida ketma-ket forward qiling. "
-        "Har bir forward avtomatik keyingi qism raqamiga biriktiriladi.\n\n"
-        "Tugatgach /done yuboring. Bekor qilish: /cancel"
+    await state.clear()
+    catalog_channel = get_setting("catalog_channel_id", CHANNEL_ID or "sozlanmagan")
+    await message.answer(
+        f"✅ <b>{name}</b> (kod <code>{code}</code>) botga qo‘shildi.\n\n"
+        f"📚 Baza kanal: <code>{catalog_channel}</code>\n\n"
+        "Endi qismlarni baza kanaliga video qilib joylang. Har bir video captioniga anime nomini va qism raqamini yozing, masalan:\n"
+        f"<code>{name} #1</code>\n<code>{name} #2</code>\n<code>{name} #3</code>\n\n"
+        "Bot qismlarni avtomatik topib, anime kartasidagi tugmalarga qo‘shadi. Kanalda bot admin bo‘lishi va baza kanali sozlangan bo‘lishi shart.\n"
+        "Agar eski postlar bo‘lsa, bot ularni avtomatik indekslamaydi; yangi postlar kelganidan boshlab indekslaydi.",
+        reply_markup=admin_menu()
     )
-    await state.update_data(progress_message_id=prompt.message_id)
 
 @dp.callback_query(F.data == "add_episode")
 async def add_episode(call: CallbackQuery, state: FSMContext):
@@ -1365,7 +1705,7 @@ async def cancel_command(message: Message, state: FSMContext):
     await message.answer("Bekor qilinadigan amal yo'q.")
 
 
-@dp.message(F.text.in_({"👤 Hisobim", "👥 Referal havolam", "👑 VIP sotib olish", "💰 Hisob to'ldirish"}))
+@dp.message(F.text.in_({"👤 Hisobim", "👥 Referal havolam", "👑 VIP sotib olish", "💰 Hisob to'ldirish", "▶️ Davom ettirish", "⭐ Yoqtirganlarim"}))
 async def main_reply_keyboard_routes(message: Message, state: FSMContext):
     """Pastki asosiy klaviaturadagi bo'limlarni tegishli amallarga yo'naltiradi."""
     text = (message.text or "").strip()
@@ -1377,7 +1717,24 @@ async def main_reply_keyboard_routes(message: Message, state: FSMContext):
     data = load_data()
     user = data.get("users", {}).get(str(message.from_user.id), {})
 
-    if text == "👤 Hisobim":
+    if text == "▶️ Davom ettirish":
+        last = user.get("last_watched") or {}
+        code = str(last.get("code", ""))
+        item = data.get("animes", {}).get(code)
+        if item:
+            await send_anime_card(message.chat.id, code, item)
+        else:
+            await message.answer("Hali tomosha qilgan narsangiz yo‘q.")
+    elif text == "⭐ Yoqtirganlarim":
+        codes = user.get("favorites", [])
+        rows = []
+        for code in codes:
+            item = data.get("animes", {}).get(str(code))
+            if item:
+                rows.append([InlineKeyboardButton(text=f"{'🎞' if item.get('media_type') == 'movie' else '🍥'} {item['name']} · {code}", callback_data=f"show:{code}")])
+        rows.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
+        await message.answer("⭐ <b>Yoqtirganlarim</b>" if len(rows) > 1 else "⭐ Hozircha saqlangan narsa yo‘q.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    elif text == "👤 Hisobim":
         referrals = len(user.get("referrals", []))
         vip_until = int(user.get("vip_until", 0) or 0)
         vip_text = f"Faol, {fmt_date(vip_until)} gacha" if vip_until > now_ts() else "Faol emas"
@@ -1392,15 +1749,15 @@ async def main_reply_keyboard_routes(message: Message, state: FSMContext):
         link = f"https://t.me/{me.username}?start={message.from_user.id}"
         await message.answer(
             f"👥 <b>Sizning referal havolangiz</b>\n\n<code>{link}</code>\n\n"
-            f"Har bir referalingiz majburiy kanallarga obuna bo'lgach hisobingizga {REFERRAL_REWARD} so'm tushadi.\n"
+            f"Har bir referalingiz majburiy kanallarga obuna bo'lgach hisobingizga {get_setting('referral_reward')} so'm tushadi.\n"
             f"Referallar soni: {len(user.get('referrals', []))}"
         )
     elif text == "👑 VIP sotib olish":
-        await message.answer("👑 <b>VIP muddatini tanlang</b>\nHar oy 25 000 so'm. 1 oydan 6 oygacha:", reply_markup=vip_keyboard())
+        await message.answer(f"👑 <b>VIP muddatini tanlang</b>\nHar oy {int(get_setting('vip_month_price')):,} so'm. 1 oydan {int(get_setting('vip_max_months'))} oygacha:".replace(",", " "), reply_markup=vip_keyboard())
     elif text == "💰 Hisob to'ldirish":
         await message.answer(
-            f"💰 <b>Hisobni to'ldirish</b>\n\nHisobingizni to'ldirish uchun admin bilan shaxsiy yozishmada kelishing: {ADMIN_CONTACT}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", url="https://t.me/AnimBot_Admin")]])
+            f"💰 <b>Hisobni to'ldirish</b>\n\nHisobingizni to'ldirish uchun admin bilan shaxsiy yozishmada kelishing: {get_setting('admin_contact')}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", url=f"https://t.me/{str(get_setting('admin_contact')).lstrip('@')}")]])
         )
 
 
@@ -1414,11 +1771,28 @@ async def fallback(message: Message):
         if code in data["animes"]:
             anime = data["animes"][code]
             if not anime_available_for_user(message.from_user.id, anime, data):
-                await message.answer("⏳ Bu anime hozircha VIP foydalanuvchilar uchun ochiq. 3 kundan keyin hammaga ochiladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")]]))
+                await message.answer(f"⏳ Bu anime hozircha VIP foydalanuvchilar uchun ochiq. {int(get_setting('vip_early_days'))} kundan keyin hammaga ochiladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👑 VIP sotib olish", callback_data="vip_buy")]]))
             else:
                 await send_anime_card(message.chat.id, code, anime)
         else:
             await message.answer("❌ Kod topilmadi. Qayta tekshiring.")
+    elif message.text and message.text.strip() and not message.text.startswith("/"):
+        query = message.text.strip().casefold()
+        if query in {"🔎 anime va kino izlash", "anime va kino izlash", "🔎 anime izlash", "anime izlash"}:
+            await message.answer("🔎 Anime yoki kino nomini yozing. Qismlar baza kanalidan avtomatik topiladi.", reply_markup=main_menu())
+            return
+        if not await require_subscription_message(message):
+            return
+        data = load_data()
+        matches = [(code, item) for code, item in data.get("animes", {}).items() if query in item.get("name", "").casefold() and anime_available_for_user(message.from_user.id, item, data)]
+        catalog_matches = [(key, item) for key, item in data.get("channel_catalog", {}).items() if query in item.get("name", "").casefold() or query in item.get("search_text", "").casefold()]
+        if matches or catalog_matches:
+            rows = [[InlineKeyboardButton(text=f"{'🎞' if item.get('media_type') == 'movie' else '🍥'} {item.get('name', 'Nomsiz')} · {code}", callback_data=f"show:{code}")] for code, item in matches[:30]]
+            rows += [[InlineKeyboardButton(text=f"🎬 {item.get('name', 'Nomsiz kino')} · baza kanal", callback_data=f"catalog_show:{key}")] for key, item in catalog_matches[:30]]
+            rows.append([InlineKeyboardButton(text="🔎 Yana qidirish", callback_data="search_name")])
+            await message.answer("🔎 <b>Topilgan anime va kinolar</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        else:
+            await message.answer("❌ Bu nom bo'yicha hech narsa topilmadi. Nomning boshqa qismini yozib ko'ring.", reply_markup=main_menu())
     elif message.text:
         await message.answer("Menyudan foydalaning.", reply_markup=main_menu())
 
