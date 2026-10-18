@@ -119,7 +119,16 @@ def small_caps_html(value):
         elif in_code:
             output.append(token)
         else:
-            output.append(small_caps(token))
+            # Texnik yozuvlarni oddiy shriftida qoldiramiz: /done, /cancel,
+            # @username va t.me havolalari. Qolgan matn tanlangan shriftga o'tadi.
+            parts = re.split(r"(/(?:[A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?|@[A-Za-z0-9_]{5,}|https?://\S+|t\.me/[A-Za-z0-9_/?=&%-]+)", token)
+            for part in parts:
+                if not part:
+                    continue
+                if re.fullmatch(r"/(?:[A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?|@[A-Za-z0-9_]{5,}|https?://\S+|t\.me/[A-Za-z0-9_/?=&%-]+", part):
+                    output.append(part)
+                else:
+                    output.append(small_caps(part))
     return "".join(output)
 
 class StyledBot(Bot):
