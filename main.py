@@ -146,7 +146,7 @@ dp = Dispatcher()
 def default_data():
     return {
         "admins": [OWNER_ID],
-        "start_text": "🍿 <b>ANIME VA KINO OLAMIGA XUSH KELIBSIZ!</b>\n\nSevimli anime va kinolaringizni qidiring, tomosha qiling va yoqtirganlaringizga saqlang.\n\n🔎 <b>Anime va Kino UZ</b>",
+        "start_text": "🍿 <b>KINO VA SERIAL OLAMIGA XUSH KELIBSIZ!</b>\n\nSevimli kino, serial, multfilm va animelaringizni qidiring va tomosha qiling.\n\n🔎 <b>Kino olami</b>",
         "channels": [],
         "animes": {},
         "channel_catalog": {},
@@ -346,7 +346,7 @@ async def send_start(message: Message, user_id=None):
 def main_menu(user_id=None):
     # Qidiruvga tegishli katalog, sevimlilar va davom ettirish ichki menyuda.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔎 Anime va Kino izlash", callback_data="search_menu")],
+        [InlineKeyboardButton(text="🔎 Kino va video izlash", callback_data="search_menu")],
         [InlineKeyboardButton(text="👤 Hisobim", callback_data="account"), InlineKeyboardButton(text="👥 Referal", callback_data="referral")],
         [InlineKeyboardButton(text="💰 Balans", callback_data="balance_help"), InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
         [InlineKeyboardButton(text="❓ VIP o‘zi nima?", callback_data="vip_info")],
@@ -363,8 +363,10 @@ def search_menu(user_id=None):
     vip = bool(user_id and is_vip(user_id))
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔢 Kod bo‘yicha qidirish", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo‘yicha qidirish", callback_data="search_name")],
-        [InlineKeyboardButton(text="📚 Animelar ro‘yxati", callback_data="list")],
         [InlineKeyboardButton(text="🎞 Kinolar ro‘yxati", callback_data="movie_list")],
+        [InlineKeyboardButton(text="📺 Seriallar ro‘yxati", callback_data="series_list")],
+        [InlineKeyboardButton(text="🧸 Multfilmlar ro‘yxati", callback_data="cartoon_list")],
+        [InlineKeyboardButton(text="🍥 Animelar ro‘yxati", callback_data="list")],
         [InlineKeyboardButton(text=("▶️ Davom ettirish" if vip else "🔒 Davom ettirish"), callback_data="continue_watching")],
         [InlineKeyboardButton(text=("♥️ Sevimlilar" if vip else "🔒 Sevimlilar"), callback_data="favorites")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
@@ -375,7 +377,7 @@ def admin_menu():
     """Oddiy admin menyusi: faqat anime va qismlarni boshqarish."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Anime qo'shish", callback_data="add_anime"), InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="add_movie")],
-        [InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="add_series")],
+        [InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="add_series"), InlineKeyboardButton(text="➕ Multfilm qo'shish", callback_data="add_cartoon")],
         [InlineKeyboardButton(text="➕ Qism qo'shish", callback_data="add_episode"),
          InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode")],
         [InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_anime"),
@@ -390,7 +392,7 @@ def owner_menu():
     """Faqat egaga ko'rinadigan to'liq boshqaruv menyusi."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Anime qo'shish", callback_data="add_anime"), InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="add_movie")],
-        [InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="add_series")],
+        [InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="add_series"), InlineKeyboardButton(text="➕ Multfilm qo'shish", callback_data="add_cartoon")],
         [InlineKeyboardButton(text="➕ Qism qo'shish", callback_data="add_episode"), InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode")],
         [InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_anime"), InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="recode_anime")],
         [InlineKeyboardButton(text="🗑 Anime o'chirish", callback_data="del_anime")],
@@ -475,7 +477,7 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
 
 def anime_caption(code: str, anime: dict) -> str:
     description = (anime.get("description") or "").strip()
-    kind = "🎞 Kino" if anime.get("media_type") == "movie" else "📺 Serial" if anime.get("media_type") == "series" else "🍥 Anime"
+    kind = "🎞 Kino" if anime.get("media_type") == "movie" else "📺 Serial" if anime.get("media_type") == "series" else "🧸 Multfilm" if anime.get("media_type") == "cartoon" else "🍥 Anime"
     seasons = anime.get("seasons") or {"1": {"episodes": anime.get("episodes", {})}}
     total_episodes = sum(len(value.get("episodes", {})) for value in seasons.values())
     base = f"{kind}: <b>{anime['name']}</b>\n\n🔢 Kod: <code>{code}</code>\n📺 Fasllar: {len(seasons)}\n🎞 Qismlar: {total_episodes}"
@@ -524,6 +526,7 @@ class Form(StatesGroup):
     anime_details = State()
     anime_season_count = State()
     episode_code = State()
+    episode_season = State()
     episode_batch = State()
     delete_code = State()
     delete_episode_code = State()
@@ -1055,14 +1058,14 @@ async def admin_balance_amount_save(message: Message, state: FSMContext):
 async def admin_command(message: Message):
     if not is_admin(message.from_user.id):
         return await message.answer("⛔ Sizda admin huquqi yo'q.")
-    await message.answer("🛠 <b>Admin paneli</b>\nFaqat anime va qismlarni boshqarish.", reply_markup=admin_menu())
+    await message.answer("🛠 <b>Admin paneli</b>\nKino, serial, multfilm va anime kontentlarini boshqarish.", reply_markup=admin_menu())
 
 
 @dp.message(Command("owner"))
 async def owner_command(message: Message):
     if not is_owner(message.from_user.id):
         return await message.answer("⛔ Bu buyruq faqat bot egasi uchun.")
-    await message.answer("👑 <b>Owner paneli</b>\nBarcha boshqaruv funksiyalari.", reply_markup=owner_menu())
+    await message.answer("👑 <b>Owner paneli</b>\nKino, serial, multfilm va anime kontentlarini boshqarish.", reply_markup=owner_menu())
 
 
 @dp.callback_query(F.data == "home")
@@ -1079,9 +1082,9 @@ async def home(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "search_menu")
 async def search_menu_open(call: CallbackQuery):
     try:
-        await call.message.edit_text("🔎 <b>Anime va Kino izlash</b>\n\nKod yoki nom orqali qidiring, ro‘yxatlardan foydalaning:", reply_markup=search_menu(call.from_user.id))
+        await call.message.edit_text("🔎 <b>Kino va video izlash</b>\n\nKod yoki nom orqali qidiring, ro‘yxatlardan foydalaning:", reply_markup=search_menu(call.from_user.id))
     except Exception:
-        await call.message.answer("🔎 <b>Anime va Kino izlash</b>\n\nKod yoki nom orqali qidiring, ro‘yxatlardan foydalaning:", reply_markup=search_menu(call.from_user.id))
+        await call.message.answer("🔎 <b>Kino va video izlash</b>\n\nKod yoki nom orqali qidiring, ro‘yxatlardan foydalaning:", reply_markup=search_menu(call.from_user.id))
     await call.answer()
 
 
@@ -1391,11 +1394,11 @@ async def anime_list(call: CallbackQuery):
     if not data["animes"]:
         await call.message.answer("📭 Hozircha anime qo'shilmagan.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")]]))
     else:
-        visible_animes = [(code, a) for code, a in data["animes"].items() if a.get("media_type", "anime") != "movie" and anime_available_for_user(call.from_user.id, a, data)]
+        visible_animes = [(code, a) for code, a in data["animes"].items() if a.get("media_type", "anime") == "anime" and anime_available_for_user(call.from_user.id, a, data)]
         rows = [[InlineKeyboardButton(text=f"🎬 {a['name']} · {code}", callback_data=f"show:{code}")]
                 for code, a in visible_animes[:80]]
         rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
-        await call.message.answer("📚 <b>Barcha animelar</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await call.message.answer("🍥 <b>Barcha animelar</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
 
 
@@ -1409,6 +1412,28 @@ async def movie_list(call: CallbackQuery):
     rows = [[InlineKeyboardButton(text=f"🎞 {item['name']} · {code}", callback_data=f"show:{code}")] for code, item in items[:80]]
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
     await call.message.answer("🎞 <b>Kinolar ro‘yxati</b>" if items else "📭 Hozircha kino qo‘shilmagan.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "series_list")
+async def series_list(call: CallbackQuery):
+    await media_category_list(call, "series", "📺 Seriallar ro‘yxati", "📭 Hozircha serial qo‘shilmagan.")
+
+
+@dp.callback_query(F.data == "cartoon_list")
+async def cartoon_list(call: CallbackQuery):
+    await media_category_list(call, "cartoon", "🧸 Multfilmlar ro‘yxati", "📭 Hozircha multfilm qo‘shilmagan.")
+
+
+async def media_category_list(call: CallbackQuery, media_type: str, title: str, empty_text: str):
+    data = load_data()
+    if not is_vip(call.from_user.id, data) and not await check_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo‘ling.", reply_markup=subscription_keyboard())
+        return await call.answer()
+    items = [(code, item) for code, item in data.get("animes", {}).items() if item.get("media_type", "anime") == media_type and anime_available_for_user(call.from_user.id, item, data)]
+    rows = [[InlineKeyboardButton(text=f"🎬 {item['name']} · {code}", callback_data=f"show:{code}")] for code, item in items[:80]]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
+    await call.message.answer(f"<b>{title}</b>" if items else empty_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
 
 
@@ -1478,7 +1503,7 @@ async def show_anime(call: CallbackQuery):
     code = call.data.split(":", 1)[1]
     data = load_data()
     if code not in data["animes"]:
-        return await call.answer("Anime topilmadi", show_alert=True)
+        return await call.answer("Kontent topilmadi", show_alert=True)
     if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
         return await call.answer("Botdan foydalanish taqiqlangan.", show_alert=True)
     if not is_vip(call.from_user.id, data) and not await check_subscription(call.from_user.id):
@@ -1488,7 +1513,7 @@ async def show_anime(call: CallbackQuery):
         await call.message.answer(f"⏳ Bu anime {int(get_setting('vip_early_days'))} kundan keyin hammaga ochiladi. Hozir VIP foydalanuvchilar ko'ra oladi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")]]))
         return await call.answer()
     try:
-        await call.message.edit_text("🎬 <b>Anime ochildi.</b>")
+        await call.message.edit_text("🎬 <b>Kontent ochildi.</b>")
     except Exception:
         try:
             await call.message.edit_reply_markup(reply_markup=None)
@@ -1531,6 +1556,16 @@ async def add_series(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@dp.callback_query(F.data == "add_cartoon")
+async def add_cartoon(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔ Adminlar uchun.", show_alert=True)
+    await state.update_data(media_type="cartoon")
+    await state.set_state(Form.anime_code)
+    await call.message.answer("🔢 Yangi multfilm uchun takrorlanmaydigan kod yuboring:")
+    await call.answer()
+
+
 @dp.message(Form.anime_code)
 async def anime_code(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -1543,7 +1578,7 @@ async def anime_code(message: Message, state: FSMContext):
     await state.update_data(new_code=code)
     await state.set_state(Form.anime_name)
     saved = await state.get_data()
-    await message.answer("🎞 Kino nomini yuboring:" if saved.get("media_type") == "movie" else "📺 Serial nomini yuboring:" if saved.get("media_type") == "series" else "🍥 Anime nomini yuboring:")
+    await message.answer("🎞 Kino nomini yuboring:" if saved.get("media_type") == "movie" else "📺 Serial nomini yuboring:" if saved.get("media_type") == "series" else "🧸 Multfilm nomini yuboring:" if saved.get("media_type") == "cartoon" else "🍥 Anime nomini yuboring:")
 
 
 @dp.message(Form.anime_name)
@@ -1557,7 +1592,7 @@ async def anime_name(message: Message, state: FSMContext):
     await state.update_data(new_name=name)
     await state.set_state(Form.anime_info)
     await message.answer(
-        "🖼 Endi anime rasmi va ma'lumotini yuboring.\n"
+        "🖼 Endi poster rasmi va ma'lumotini yuboring.\n"
         "• Rasmni caption bilan yuboring; yoki\n"
         "• Faqat tavsif matnini yuboring.\n"
         "Rasm/tavsif kerak bo'lmasa /skip yuboring."
@@ -1615,14 +1650,14 @@ async def anime_details_save(message: Message, state: FSMContext):
     }
     save_data(data)
     await state.set_state(Form.anime_season_count)
-    await message.answer("📺 Bu anime/serial nechta fasldan iborat? Faqat son yuboring. Kino uchun 1 deb yozing:")
+    await message.answer("📺 Bu kontent nechta fasldan iborat? Faqat son yuboring. Kino yoki bir faslli multfilm uchun 1 deb yozing:")
 
 
 async def notify_content_added(code: str, item: dict):
     """Yangi anime/kino qo‘shilganda barcha ro‘yxatdan o‘tgan foydalanuvchilarga xabar."""
     data = load_data()
     is_movie = item.get("media_type") == "movie"
-    label = "KINO" if is_movie else "SERIAL" if item.get("media_type") == "series" else "ANIME"
+    label = "KINO" if is_movie else "SERIAL" if item.get("media_type") == "series" else "MULTFILM" if item.get("media_type") == "cartoon" else "ANIME"
     text = (f"🎉 <b>BAZAMIZGA YANGI {label} QO‘SHILDI!</b>\n\n"
             f"🎬 Nomi: <b>{item.get('name', 'Nomsiz')}</b>\n"
             f"🔢 Kodi: <code>{code}</code>\n\n"
@@ -1668,7 +1703,7 @@ async def anime_season_count_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "add_episode")
 async def add_episode(call: CallbackQuery, state: FSMContext):
-    await ask(call, state, Form.episode_code, "Qismlar qo'shiladigan anime kodini yuboring:")
+    await ask(call, state, Form.episode_code, "Qismlar qo‘shiladigan kino/serial/multfilm/anime kodini yuboring:")
 
 
 @dp.message(Form.episode_code)
@@ -1679,13 +1714,42 @@ async def episode_code(message: Message, state: FSMContext):
     code = (message.text or "").strip()
     data = load_data()
     if code not in data["animes"]:
-        return await message.answer("❌ Bunday kodli anime yo'q. Qayta yuboring:")
-    await state.update_data(batch_code=code, batch_count=0)
+        return await message.answer("❌ Bunday kod topilmadi. Qayta yuboring:")
+    item = data["animes"][code]
+    seasons = item.get("seasons") or {"1": {"episodes": item.get("episodes", {})}}
+    await state.update_data(batch_code=code)
+    await state.set_state(Form.episode_season)
+    await message.answer(
+        f"🎬 <b>{item['name']}</b> tanlandi.\nMavjud fasllar: {', '.join(sorted(seasons, key=lambda x: int(x) if str(x).isdigit() else 999))}\n\n"
+        "Qaysi faslga qism qo‘shamiz? Fasl raqamini yuboring (masalan: 2).\n"
+        "Agar bu yangi fasl bo‘lsa ham raqamini yozing."
+    )
+
+
+@dp.message(Form.episode_season)
+async def episode_season_select(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Bu amal faqat adminlar uchun.")
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= 100:
+        return await message.answer("Fasl raqamini 1 dan 100 gacha raqam bilan yuboring, masalan 2:")
+    season_no = str(int(raw))
+    saved = await state.get_data()
+    code = str(saved.get("batch_code", ""))
+    data = load_data()
+    item = data.get("animes", {}).get(code)
+    if not item:
+        await state.clear()
+        return await message.answer("Kontent topilmadi. Qaytadan boshlang.", reply_markup=admin_menu())
+    item.setdefault("seasons", {}).setdefault(season_no, {"episodes": {}})
+    save_data(data)
+    await state.update_data(batch_season=season_no, batch_count=0)
     await state.set_state(Form.episode_batch)
     prompt = await message.answer(
-        f"🎬 <b>{data['animes'][code]['name']}</b> uchun videolarni shu chatga ketma-ket yuboring.\n"
-        "Kanalga joylash yoki forward qilish shart emas. Qismlar avtomatik 1-qism, 2-qism, 3-qism bo‘lib raqamlanadi.\n"
-        "Tugatgach /done yuboring. Bekor qilish: /cancel"
+        f"🎬 <b>{item['name']}</b> · <b>{season_no}-fasl</b>\nVideolarni ketma-ket yuboring.\n"
+        "Bot shu faslda avtomatik 1-qism, 2-qism, 3-qism deb raqamlaydi.\n"
+        "Tugatish: /done · Bekor qilish: /cancel"
     )
     await state.update_data(progress_message_id=prompt.message_id)
 
@@ -1730,7 +1794,8 @@ async def episode_batch_message(message: Message, state: FSMContext):
     if not anime:
         await state.clear()
         return await message.answer("❌ Kontent topilmadi. Qaytadan boshlang.", reply_markup=admin_menu())
-    season = anime.setdefault("seasons", {}).setdefault("1", {"episodes": {}})
+    season_no = str(saved.get("batch_season", "1"))
+    season = anime.setdefault("seasons", {}).setdefault(season_no, {"episodes": {}})
     episodes = season.setdefault("episodes", {})
     numeric = [int(n) for n in episodes if str(n).isdigit()]
     number = max(numeric, default=0) + 1
@@ -1746,7 +1811,7 @@ async def episode_batch_message(message: Message, state: FSMContext):
             await bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=progress_id,
-                text=(f"🎬 <b>{anime['name']}</b>\n✅ {count} ta qism saqlandi. Oxirgisi: <b>{number}-qism</b>.\n\n"
+                text=(f"🎬 <b>{anime['name']}</b> · {season_no}-fasl\n✅ {count} ta qism saqlandi. Oxirgisi: <b>{number}-qism</b>.\n\n"
                       "Keyingi videolarni shu chatga ketma-ket yuboring.\nTugatish: /done · Bekor qilish: /cancel")
             )
         except Exception:
