@@ -30,7 +30,32 @@ _SMALL_CAPS = str.maketrans({
 def small_caps(value):
     return str(value).translate(_SMALL_CAPS)
 def InlineKeyboardButton(*, text, **kwargs):
+    """Inline tugmalar rangini owner sozlamasidan oladi (Telegram Bot API button style)."""
+    try:
+        path = Path(os.getenv("DATA_FILE", "data.json"))
+        if path.exists():
+            _cfg = json.loads(path.read_text(encoding="utf-8")).get("settings", {})
+            _colors = _cfg.get("button_colors", {})
+            _cb = str(kwargs.get("callback_data", ""))
+            _group = _button_color_group(_cb, str(text))
+            _color = _colors.get(_group) or _colors.get("all")
+            if _color in ("primary", "success", "danger"):
+                kwargs.setdefault("style", _color)
+    except Exception:
+        pass
     return TelegramInlineKeyboardButton(text=small_caps(text), **kwargs)
+
+def _button_color_group(callback_data, text=""):
+    cb = str(callback_data or "")
+    if cb in ("home", "admin_home", "search_menu") or "Orqaga" in text or "Asosiy menyu" in text:
+        return "back"
+    if cb.startswith(("episode:", "show:", "season_show:", "catalog_show:")) or cb in ("list", "movie_list", "continue_watching"):
+        return "content"
+    if cb.startswith(("vip_", "uservip:", "userunvip:")) or "VIP" in text:
+        return "vip"
+    if cb in ("search", "search_name", "search_menu") or "qidirish" in text.casefold():
+        return "search"
+    return "other"
 
 # ================== SOZLAMALAR ==================
 # Render Environment Variables: BOT_TOKEN, OWNER_ID, ADMIN_ID.
@@ -125,7 +150,7 @@ def default_data():
         "users": {},
         "banned_users": [],
         "referral_events": {},
-        "settings": {"referral_reward": 199, "vip_month_price": 25000, "vip_max_months": 6, "vip_month_days": 30, "vip_early_days": 3, "admin_contact": "@AnimBot_Admin", "regular_channel_id": "", "vip_channel_id": ""}
+        "settings": {"referral_reward": 199, "vip_month_price": 25000, "vip_max_months": 6, "vip_month_days": 30, "vip_early_days": 3, "admin_contact": "@AnimBot_Admin", "regular_channel_id": "", "vip_channel_id": "", "button_colors": {}}
     }
 
 
@@ -160,6 +185,7 @@ def load_data():
         user.setdefault("vip_warning_sent_for", 0)
         user.setdefault("favorites", [])
         user.setdefault("last_watched", None)
+        user.setdefault("last_seen", user.get("joined_at", 0))
     return data
 
 
@@ -201,12 +227,13 @@ def ensure_user(data, tg_user):
             "first_name": getattr(tg_user, "first_name", "") or "",
             "balance": 0, "referrals": [], "referred_by": None,
             "referral_rewarded": False, "vip_until": 0, "vip_warning_sent_for": 0,
-            "favorites": [], "last_watched": None, "joined_at": now_ts()
+            "favorites": [], "last_watched": None, "joined_at": now_ts(), "last_seen": now_ts()
         }
     else:
         user = data["users"][uid]
         user["username"] = getattr(tg_user, "username", None)
         user["first_name"] = getattr(tg_user, "first_name", "") or user.get("first_name", "")
+        user["last_seen"] = now_ts()
     return data["users"][uid], is_new
 
 
@@ -351,6 +378,7 @@ def admin_menu():
         [InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_anime"),
          InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="recode_anime")],
         [InlineKeyboardButton(text="🗑 Anime o'chirish", callback_data="del_anime")],
+        [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
     ])
 
 
@@ -367,6 +395,8 @@ def owner_menu():
         [InlineKeyboardButton(text="📝 /start xabarini o'zgartirish", callback_data="start_text")],
         [InlineKeyboardButton(text="👥 Obunachilarni boshqarish", callback_data="manage_users")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
+        [InlineKeyboardButton(text="🎨 Chiroyli ko‘rinish", callback_data="appearance")],
+        [InlineKeyboardButton(text="📣 Hammaga xabar yuborish", callback_data="broadcast")],
         [InlineKeyboardButton(text="📚 Baza kanalini sozlash", callback_data="setcfg:catalog_channel_id")],
         [InlineKeyboardButton(text="⚙️ Bot sozlamalari", callback_data="owner_settings")],
     ])
@@ -504,6 +534,7 @@ class Form(StatesGroup):
     admin_vip_months = State()
     admin_balance_amount = State()
     owner_setting_value = State()
+    broadcast_message = State()
 
 
 def parse_channel_entry(entry):
@@ -1087,6 +1118,7 @@ async def index_storage_channel_post(message: Message):
             return (message.chat.username or "").casefold() == ref[1:].casefold()
         return channel_id == ref
     tier = "vip" if matches(vip_ref) else "regular" if matches(regular_ref) else "legacy" if matches(legacy_ref) else ""
+    shared_base = bool(regular_ref and not vip_ref and matches(regular_ref))
     if not tier:
         return
     text = (message.caption or message.text or "").strip()
@@ -1100,9 +1132,13 @@ async def index_storage_channel_post(message: Message):
         anime = data["animes"][code_tag]
         season = anime.setdefault("seasons", {}).setdefault(str(int(season_tag)), {"episodes": {}})
         season.setdefault("episodes", {}).setdefault(str(int(part_tag)), {})[tier] = {"chat_id": message.chat.id, "message_id": message.message_id}
+        if shared_base:
+            season["episodes"][str(int(part_tag))]["vip"] = season["episodes"][str(int(part_tag))][tier]
         # Legacy `episodes` mapping retained for old content and old callbacks.
         if str(int(season_tag)) == "1":
             anime.setdefault("episodes", {}).setdefault(str(int(part_tag)), {})[tier] = {"chat_id": message.chat.id, "message_id": message.message_id}
+            if shared_base:
+                anime["episodes"][str(int(part_tag))]["vip"] = anime["episodes"][str(int(part_tag))][tier]
         save_data(data)
         logging.info("Indexed %s: code=%s season=%s episode=%s", tier, code_tag, season_tag, part_tag)
         return
@@ -1119,6 +1155,8 @@ async def index_storage_channel_post(message: Message):
         anime = data["animes"][matched_code]
         season = anime.setdefault("seasons", {}).setdefault("1", {"episodes": {}})
         season.setdefault("episodes", {}).setdefault(str(int(old_part)), {})[tier] = {"chat_id": message.chat.id, "message_id": message.message_id}
+        if shared_base:
+            season["episodes"][str(int(old_part))]["vip"] = season["episodes"][str(int(old_part))][tier]
         save_data(data)
         return
     # Eski umumiy katalog indekslashni saqlab qolamiz.
@@ -1944,16 +1982,118 @@ async def start_text_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "stats")
 async def stats(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("Adminlar uchun", show_alert=True)
+    if not is_admin(call.from_user.id):
+        return await call.answer("Faqat adminlar uchun", show_alert=True)
     data = load_data()
-    total_episodes = sum(len(a.get("episodes", {})) for a in data["animes"].values())
+    users = list(data.get("users", {}).values())
+    cutoff = now_ts() - 30 * 24 * 60 * 60
+    active = sum(1 for u in users if int(u.get("last_seen", u.get("joined_at", 0)) or 0) >= cutoff)
+    inactive = max(0, len(users) - active)
+    total_episodes = sum(sum(len(season.get("episodes", {})) for season in (a.get("seasons") or {}).values()) if a.get("seasons") else len(a.get("episodes", {})) for a in data["animes"].values())
     await call.message.answer(
-        f"📊 <b>Statistika</b>\n🎬 Anime: {len(data['animes'])}\n"
-        f"🎞 Qismlar: {total_episodes}\n👑 Adminlar: {len(data['admins'])}\n"
-        f"📢 Kanallar: {len(data['channels'])}"
+        f"📊 <b>Statistika</b>\n👥 Jami foydalanuvchilar: {len(users)}\n"
+        f"🟢 Faol (oxirgi 30 kun): {active}\n⚫ Faol emas (30 kundan beri): {inactive}\n"
+        f"🎬 Anime/kino/serial: {len(data['animes'])}\n🎞 Qismlar: {total_episodes}\n"
+        f"👑 Adminlar: {len(data['admins'])}\n📢 Kanallar: {len(data['channels'])}"
     )
     await call.answer()
+
+
+@dp.callback_query(F.data == "appearance")
+async def appearance_menu(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data()
+    colors = data.get("settings", {}).get("button_colors", {})
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔎 Qidirish tugmalari: {colors.get('search', 'standart')}", callback_data="color_group:search")],
+        [InlineKeyboardButton(text=f"🎬 Kontent tugmalari: {colors.get('content', 'standart')}", callback_data="color_group:content")],
+        [InlineKeyboardButton(text=f"💎 VIP tugmalari: {colors.get('vip', 'standart')}", callback_data="color_group:vip")],
+        [InlineKeyboardButton(text=f"⬅️ Orqaga tugmalari: {colors.get('back', 'standart')}", callback_data="color_group:back")],
+        [InlineKeyboardButton(text=f"🧩 Boshqa tugmalar: {colors.get('other', 'standart')}", callback_data="color_group:other")],
+        [InlineKeyboardButton(text="🌈 Barcha tugmalar", callback_data="color_group:all")],
+        [InlineKeyboardButton(text="♻️ Ranglarni tozalash", callback_data="color_reset")],
+        [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
+    ])
+    await call.message.answer("🎨 <b>Chiroyli ko‘rinish</b>\nTugma guruhini tanlang, keyin rangini belgilang. Telegram faqat ko‘k, yashil va qizil uslublarni qo‘llasa ko‘rsatadi.", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("color_group:"))
+async def color_group_select(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    group = call.data.split(":", 1)[1]
+    if group not in {"search", "content", "vip", "back", "other", "all"}:
+        return await call.answer("Noto‘g‘ri guruh", show_alert=True)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟥 Qizil", callback_data=f"color_set:{group}:danger")],
+        [InlineKeyboardButton(text="🟩 Yashil", callback_data=f"color_set:{group}:success")],
+        [InlineKeyboardButton(text="🟦 Ko‘k", callback_data=f"color_set:{group}:primary")],
+        [InlineKeyboardButton(text="⚪ Standart rang", callback_data=f"color_set:{group}:default")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="appearance")]
+    ])
+    await call.message.answer("Rangni tanlang:", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("color_set:"))
+async def color_set_save(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    _, group, color = call.data.split(":", 2)
+    if group not in {"search", "content", "vip", "back", "other", "all"} or color not in {"danger", "success", "primary", "default"}:
+        return await call.answer("Noto‘g‘ri rang", show_alert=True)
+    data = load_data()
+    colors = data.setdefault("settings", {}).setdefault("button_colors", {})
+    if color == "default": colors.pop(group, None)
+    else: colors[group] = color
+    save_data(data)
+    await appearance_menu(call)
+    await call.answer("Rang saqlandi")
+
+
+@dp.callback_query(F.data == "color_reset")
+async def color_reset(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data()
+    data.setdefault("settings", {}).pop("button_colors", None)
+    save_data(data)
+    await appearance_menu(call)
+    await call.answer("Ranglar tozalandi")
+
+
+@dp.callback_query(F.data == "broadcast")
+async def broadcast_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    await state.set_state(Form.broadcast_message)
+    await call.message.answer("📣 Barcha foydalanuvchilarga yuboriladigan xabarni matn, rasm yoki video sifatida yuboring. Bekor qilish: /cancel")
+    await call.answer()
+
+
+@dp.message(Form.broadcast_message)
+async def broadcast_send(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return await message.answer("Faqat owner uchun.")
+    if (message.text or "").strip() == "/cancel":
+        await state.clear()
+        return await message.answer("Yuborish bekor qilindi.", reply_markup=owner_menu())
+    data = load_data()
+    recipients = list(data.get("users", {}).keys())
+    sent = failed = 0
+    await state.clear()
+    for uid in recipients:
+        try:
+            await bot.copy_message(chat_id=int(uid), from_chat_id=message.chat.id, message_id=message.message_id)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logging.info("Broadcast %s ga yuborilmadi: %s", uid, exc)
+        await asyncio.sleep(0.04)
+    await message.answer(f"📣 Xabar yuborish tugadi.\n✅ Yetkazildi: {sent}\n❌ Yetkazilmadi: {failed}", reply_markup=owner_menu())
 
 
 @dp.callback_query(F.data == "check_sub")
