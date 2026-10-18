@@ -30,13 +30,16 @@ _SMALL_CAPS = str.maketrans({
 def small_caps(value):
     return str(value).translate(_SMALL_CAPS)
 def InlineKeyboardButton(*, text, **kwargs):
-    """Inline tugmalar rangini owner sozlamasidan oladi (Telegram Bot API button style)."""
+    """Owner sozlagan tugma nomi va rangini qo'llaydi."""
     try:
         path = Path(os.getenv("DATA_FILE", "data.json"))
         if path.exists():
             _cfg = json.loads(path.read_text(encoding="utf-8")).get("settings", {})
-            _colors = _cfg.get("button_colors", {})
             _cb = str(kwargs.get("callback_data", ""))
+            _custom_text = _cfg.get("button_texts", {}).get(_cb)
+            if _custom_text:
+                text = _custom_text
+            _colors = _cfg.get("button_colors", {})
             _group = _button_color_group(_cb, str(text))
             _color = _colors.get(_group) or _colors.get("all")
             if _color in ("primary", "success", "danger"):
@@ -150,7 +153,7 @@ def default_data():
         "users": {},
         "banned_users": [],
         "referral_events": {},
-        "settings": {"referral_reward": 199, "vip_month_price": 25000, "vip_max_months": 6, "vip_month_days": 30, "vip_early_days": 3, "admin_contact": "@AnimBot_Admin", "regular_channel_id": "", "vip_channel_id": "", "button_colors": {}}
+        "settings": {"referral_reward": 199, "vip_month_price": 25000, "vip_max_months": 6, "vip_month_days": 30, "vip_early_days": 3, "admin_contact": "@AnimBot_Admin", "regular_channel_id": "", "vip_channel_id": "", "button_colors": {}, "button_texts": {}}
     }
 
 
@@ -379,6 +382,7 @@ def admin_menu():
          InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="recode_anime")],
         [InlineKeyboardButton(text="🗑 Anime o'chirish", callback_data="del_anime")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
+        [InlineKeyboardButton(text="🎨 Chiroyli ko‘rinish", callback_data="appearance")],
     ])
 
 
@@ -538,6 +542,7 @@ class Form(StatesGroup):
     admin_balance_amount = State()
     owner_setting_value = State()
     broadcast_message = State()
+    button_text_value = State()
 
 
 def parse_channel_entry(entry):
@@ -2029,8 +2034,8 @@ async def stats(call: CallbackQuery):
 
 @dp.callback_query(F.data == "appearance")
 async def appearance_menu(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+    if not is_admin(call.from_user.id):
+        return await call.answer("Faqat admin va owner uchun", show_alert=True)
     data = load_data()
     colors = data.get("settings", {}).get("button_colors", {})
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2041,6 +2046,7 @@ async def appearance_menu(call: CallbackQuery):
         [InlineKeyboardButton(text=f"🧩 Boshqa tugmalar: {colors.get('other', 'standart')}", callback_data="color_group:other")],
         [InlineKeyboardButton(text="🌈 Barcha tugmalar", callback_data="color_group:all")],
         [InlineKeyboardButton(text="♻️ Ranglarni tozalash", callback_data="color_reset")],
+        [InlineKeyboardButton(text="✏️ Tugma nomlarini o‘zgartirish", callback_data="button_text_menu")],
         [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
     ])
     await call.message.answer("🎨 <b>Chiroyli ko‘rinish</b>\nTugma guruhini tanlang, keyin rangini belgilang. Telegram inline tugmalarda faqat standart, ko‘k (primary), yashil (success) va qizil (danger) uslublarni beradi; boshqa rangni kod bilan majburlab bo‘lmaydi.", reply_markup=kb)
@@ -2049,8 +2055,8 @@ async def appearance_menu(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("color_group:"))
 async def color_group_select(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+    if not is_admin(call.from_user.id):
+        return await call.answer("Faqat admin va owner uchun", show_alert=True)
     group = call.data.split(":", 1)[1]
     if group not in {"search", "content", "vip", "back", "other", "all"}:
         return await call.answer("Noto‘g‘ri guruh", show_alert=True)
@@ -2067,8 +2073,8 @@ async def color_group_select(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("color_set:"))
 async def color_set_save(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+    if not is_admin(call.from_user.id):
+        return await call.answer("Faqat admin va owner uchun", show_alert=True)
     _, group, color = call.data.split(":", 2)
     if group not in {"search", "content", "vip", "back", "other", "all"} or color not in {"danger", "success", "primary", "default"}:
         return await call.answer("Noto‘g‘ri rang", show_alert=True)
@@ -2083,13 +2089,114 @@ async def color_set_save(call: CallbackQuery):
 
 @dp.callback_query(F.data == "color_reset")
 async def color_reset(call: CallbackQuery):
-    if not is_owner(call.from_user.id):
-        return await call.answer("Faqat owner uchun", show_alert=True)
+    if not is_admin(call.from_user.id):
+        return await call.answer("Faqat admin va owner uchun", show_alert=True)
     data = load_data()
     data.setdefault("settings", {}).pop("button_colors", None)
     save_data(data)
     await appearance_menu(call)
     await call.answer("Ranglar tozalandi")
+
+
+# Tugma matnlarini owner panelidan almashtirish mumkin. Kalitlar callback_data bilan bog'langan.
+EDITABLE_BUTTONS = {
+    "search_menu": "🔎 Anime va Kino izlash",
+    "account": "👤 Hisobim",
+    "referral": "👥 Referal",
+    "balance_help": "💰 Balans / hisob to‘ldirish",
+    "vip_buy": "💎 VIP olish",
+    "vip_info": "❓ VIP o‘zi nima?",
+    "guide": "📖 Qo‘llanma",
+    "search": "🔢 Kod bo‘yicha qidirish",
+    "search_name": "🔠 Nom bo‘yicha qidirish",
+    "list": "📚 Animelar ro‘yxati",
+    "movie_list": "🎞 Kinolar ro‘yxati",
+    "continue_watching": "▶️ Davom ettirish",
+    "favorites": "♥️ Sevimlilar",
+    "home": "⬅️ Orqaga / asosiy menyu",
+    "add_anime": "➕ Anime qo‘shish",
+    "add_movie": "➕ Kino qo‘shish",
+    "add_series": "➕ Serial qo‘shish",
+    "add_episode": "➕ Qism qo‘shish",
+    "del_episode": "🗑 Qism o‘chirish",
+    "rename_anime": "✏️ Nomini o‘zgartirish",
+    "recode_anime": "🔢 Kodini o‘zgartirish",
+    "del_anime": "🗑 Anime o‘chirish",
+    "stats": "📊 Statistika",
+    "broadcast": "📣 Hammaga xabar yuborish",
+}
+
+@dp.callback_query(F.data == "button_text_menu")
+async def button_text_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+    data = load_data()
+    saved = data.get("settings", {}).get("button_texts", {})
+    rows = []
+    for key, default_label in EDITABLE_BUTTONS.items():
+        label = saved.get(key, default_label)
+        shown = label if len(label) <= 32 else label[:29] + "…"
+        rows.append([InlineKeyboardButton(text=shown, callback_data=f"button_text_edit:{key}")])
+    rows.append([InlineKeyboardButton(text="♻️ Nomlarni standartga qaytarish", callback_data="button_text_reset")])
+    rows.append([InlineKeyboardButton(text="⬅️ Ko‘rinish sozlamalari", callback_data="appearance")])
+    await call.message.answer(
+        "✏️ <b>Tugma nomlarini o‘zgartirish</b>\nO‘zgartirmoqchi bo‘lgan tugmani tanlang. Matn va oddiy emoji yozishingiz mumkin.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("button_text_edit:"))
+async def button_text_edit(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+    key = call.data.split(":", 1)[1]
+    if key not in EDITABLE_BUTTONS:
+        return await call.answer("Tugma topilmadi", show_alert=True)
+    await state.update_data(button_text_key=key)
+    await state.set_state(Form.button_text_value)
+    await call.message.answer(
+        f"Tanlangan tugma: <b>{EDITABLE_BUTTONS[key]}</b>\nYangi nomini yuboring (1–64 belgi). /cancel — bekor qilish.\n\n"
+        "Eslatma: Telegram inline tugma matnida Premium custom emoji ID/entity qo‘llab-quvvatlanmaydi. Oddiy emoji va matn ishlaydi."
+    )
+    await call.answer()
+
+@dp.message(Form.button_text_value)
+async def button_text_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    new_text = (message.text or "").strip()
+    if not new_text:
+        return await message.answer("Matn bo‘sh bo‘lmasin. Yangi nom yuboring yoki /cancel bosing.")
+    if len(new_text) > 64:
+        return await message.answer("Tugma nomi 64 belgidan oshmasin. Qisqaroq nom yuboring.")
+    state_data = await state.get_data()
+    key = state_data.get("button_text_key")
+    if key not in EDITABLE_BUTTONS:
+        await state.clear()
+        return await message.answer("Tugma topilmadi. Qaytadan urinib ko‘ring.")
+    data = load_data()
+    texts = data.setdefault("settings", {}).setdefault("button_texts", {})
+    if new_text == EDITABLE_BUTTONS[key]:
+        texts.pop(key, None)
+    else:
+        texts[key] = new_text
+    save_data(data)
+    await state.clear()
+    await message.answer("✅ Tugma nomi saqlandi. Menyuni qayta ochganda yangi nom ko‘rinadi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Yana nom o‘zgartirish", callback_data="button_text_menu")],
+        [InlineKeyboardButton(text="🎨 Ko‘rinish sozlamalari", callback_data="appearance")],
+    ]))
+
+@dp.callback_query(F.data == "button_text_reset")
+async def button_text_reset(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+    data = load_data()
+    data.setdefault("settings", {}).pop("button_texts", None)
+    save_data(data)
+    await button_text_menu(call)
+    await call.answer("Tugma nomlari standartga qaytarildi")
 
 
 @dp.callback_query(F.data == "broadcast")
