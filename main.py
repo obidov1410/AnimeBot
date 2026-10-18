@@ -47,7 +47,7 @@ def InlineKeyboardButton(*, text, **kwargs):
 
 def _button_color_group(callback_data, text=""):
     cb = str(callback_data or "")
-    if cb in ("home", "admin_home", "search_menu") or "Orqaga" in text or "Asosiy menyu" in text:
+    if cb in ("home", "admin_home") or "Orqaga" in text or "Asosiy menyu" in text:
         return "back"
     if cb.startswith(("episode:", "show:", "season_show:", "catalog_show:")) or cb in ("list", "movie_list", "continue_watching"):
         return "content"
@@ -432,7 +432,7 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
         visible_seasons = []
         for sn in season_keys:
             eps = seasons.get(sn, {}).get("episodes", {})
-            if any((isinstance(rec, dict) and (tier in rec or "chat_id" in rec)) for rec in eps.values()):
+            if any((isinstance(rec, dict) and (tier in rec or "chat_id" in rec or "file_id" in rec)) for rec in eps.values()):
                 visible_seasons.append(sn)
         # Fasllar oldindan kiritilgan, ammo postlar hali kelmagan bo‘lsa, fasllarni ham ko‘rsatamiz.
         if not visible_seasons:
@@ -449,6 +449,9 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
         separate_bases_configured = bool(get_setting("regular_channel_id") or get_setting("vip_channel_id"))
         for number, record in season_episodes.items():
             if isinstance(record, dict) and tier in record and isinstance(record[tier], dict):
+                available_numbers.append(number)
+            elif isinstance(record, dict) and "file_id" in record:
+                # Ruchnoy qo'shilgan fayllar kanal sozlamalaridan mustaqil.
                 available_numbers.append(number)
             elif isinstance(record, dict) and "chat_id" in record and not separate_bases_configured:
                 # Eski bitta-bazali format faqat ikki baza sozlanmagan holatda ishlaydi.
@@ -1331,24 +1334,42 @@ async def send_episode(call: CallbackQuery):
         tier = "vip" if is_vip(call.from_user.id, current_data) else "regular"
         if isinstance(episode_record, dict) and tier in episode_record:
             episode = episode_record[tier]
-        elif isinstance(episode_record, dict) and "chat_id" in episode_record and not (current_data.get("settings", {}).get("regular_channel_id") or current_data.get("settings", {}).get("vip_channel_id")):
+        elif isinstance(episode_record, dict) and "file_id" in episode_record:
+            # Yangi, ruchnoy qo'shilgan qism.
+            episode = episode_record
+        elif isinstance(episode_record, dict) and "regular" in episode_record:
+            # VIP versiyasi yo'q bo'lsa oddiy versiyadan foydalanadi.
+            episode = episode_record.get("regular") or episode_record.get("vip")
+        elif isinstance(episode_record, dict) and "chat_id" in episode_record:
+            # Eski kanalga bog'langan qismlar bilan moslik.
             episode = episode_record
         else:
             episode = None
-        if not episode or not isinstance(episode, dict) or "chat_id" not in episode:
-            await call.answer("Bu qism sizning bazangizga hali joylanmagan.", show_alert=True)
+        if not episode or not isinstance(episode, dict):
+            await call.answer("Bu qism hali qo'shilmagan.", show_alert=True)
             return
         user = current_data.setdefault("users", {}).setdefault(str(call.from_user.id), {})
         user["last_watched"] = {"code": code, "season": season_number, "number": number, "media_type": anime.get("media_type", "anime"), "updated_at": now_ts()}
         save_data(current_data)
-        source_chat = episode["chat_id"]
-        source_message = episode["message_id"]
-        await bot.copy_message(
-            chat_id=call.from_user.id,
-            from_chat_id=source_chat,
-            message_id=source_message,
-            protect_content=not is_vip(call.from_user.id, current_data)
-        )
+        protect = not is_vip(call.from_user.id, current_data)
+        if episode.get("file_id"):
+            media_type = episode.get("media_type", "video")
+            file_id = episode["file_id"]
+            caption = episode.get("caption") or f"🎬 <b>{anime.get('name', 'Kontent')}</b> — {number}-qism"
+            send_method = {
+                "video": bot.send_video,
+                "document": bot.send_document,
+                "audio": bot.send_audio,
+                "animation": bot.send_animation,
+                "photo": bot.send_photo,
+                "voice": bot.send_voice,
+            }.get(media_type, bot.send_video)
+            await send_method(chat_id=call.from_user.id, **{media_type: file_id}, caption=caption, protect_content=protect)
+        elif "chat_id" in episode and "message_id" in episode:
+            await bot.copy_message(chat_id=call.from_user.id, from_chat_id=episode["chat_id"], message_id=episode["message_id"], protect_content=protect)
+        else:
+            await call.answer("Qism ma'lumoti noto'g'ri saqlangan.", show_alert=True)
+            return
         await call.answer("Qism yuborildi")
     except Exception:
         await call.answer("❌ Qism yuborilmadi. Kanal va xabarni tekshiring.", show_alert=True)
@@ -1631,16 +1652,11 @@ async def anime_season_count_save(message: Message, state: FSMContext):
     save_data(data)
     await state.clear()
     await notify_content_added(code, item)
-    regular_channel = get_setting("regular_channel_id") or "sozlanmagan"
-    vip_channel = get_setting("vip_channel_id") or "sozlanmagan"
     await message.answer(
         f"✅ <b>{item['name']}</b> (kod <code>{code}</code>) botga qo‘shildi.\n\n"
-        f"📺 Fasllar: {count} ta\n👥 Oddiy baza: <code>{regular_channel}</code>\n👑 VIP baza: <code>{vip_channel}</code>\n\n"
-        "Videolarni tegishli kanallarga quyidagi caption shaklida joylang:\n"
-        f"<code>#{'kino' if item.get('media_type') == 'movie' else 'serial' if item.get('media_type') == 'series' else 'anime'}_{code} #season_1 #1</code>\n"
-        f"<code>#{'kino' if item.get('media_type') == 'movie' else 'serial' if item.get('media_type') == 'series' else 'anime'}_{code} #season_1 #2</code>\n"
-        f"<code>#{'kino' if item.get('media_type') == 'movie' else 'serial' if item.get('media_type') == 'series' else 'anime'}_{code} #season_2 #1</code> (2-fasl uchun)\n\n"
-        "Fasl va qism raqamlarini o‘zgartiring. VIP/oddiy postlar alohida indekslanadi. Botni ikkala kanalda ham admin qiling.",
+        f"📺 Fasllar: {count} ta\n\n"
+        "Endi Admin panel → <b>Qism qo‘shish</b> ni bosing, kodini kiriting va videolarni botga ketma-ket yuboring.\n"
+        "Qismlar avtomatik raqamlanadi. Kanal, hashtag yoki forward kerak emas.",
         reply_markup=admin_menu()
     )
 
@@ -1662,8 +1678,8 @@ async def episode_code(message: Message, state: FSMContext):
     await state.update_data(batch_code=code, batch_count=0)
     await state.set_state(Form.episode_batch)
     prompt = await message.answer(
-        f"🎬 <b>{data['animes'][code]['name']}</b> uchun barcha yangi qismlarni ketma-ket forward qiling.\n"
-        "Qismlar mavjud raqamlardan keyin avtomatik raqamlanadi.\n"
+        f"🎬 <b>{data['animes'][code]['name']}</b> uchun videolarni shu chatga ketma-ket yuboring.\n"
+        "Kanalga joylash yoki forward qilish shart emas. Qismlar avtomatik 1-qism, 2-qism, 3-qism bo‘lib raqamlanadi.\n"
         "Tugatgach /done yuboring. Bekor qilish: /cancel"
     )
     await state.update_data(progress_message_id=prompt.message_id)
@@ -1671,39 +1687,51 @@ async def episode_code(message: Message, state: FSMContext):
 
 @dp.message(Form.episode_batch)
 async def episode_batch_message(message: Message, state: FSMContext):
+    """Admin videolarni botning o'ziga yuboradi; kanal/forward bazasi talab qilinmaydi."""
     if not is_admin(message.from_user.id):
         await state.clear()
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     if (message.text or "").strip().lower() in ("/done", "done", "tayyor"):
         saved = await state.get_data()
         count = int(saved.get("batch_count", 0))
-        code = saved.get("batch_code")
         await state.clear()
         return await message.answer(f"✅ Yakunlandi. {count} ta qism saqlandi.", reply_markup=admin_menu())
-    origin = message.forward_origin
-    source_chat = None
-    source_message = None
-    if origin and getattr(origin, "chat", None):
-        source_chat = origin.chat.id
-        source_message = getattr(origin, "message_id", None)
-    if source_chat is None and message.forward_from_chat:
-        source_chat = message.forward_from_chat.id
-        source_message = message.forward_from_message_id
-    if source_chat is None or source_message is None:
-        return await message.answer("❌ Kanal postini forward qiling. Tugatish uchun /done, bekor qilish uchun /cancel.")
-    saved = await state.get_data()
-    code = saved.get("batch_code")
-    data = load_data()
-    if code not in data["animes"]:
+    if (message.text or "").strip().lower() == "/cancel":
         await state.clear()
-        return await message.answer("❌ Anime topilmadi, amal bekor qilindi.", reply_markup=admin_menu())
-    anime = data["animes"][code]
+        return await message.answer("❎ Bekor qilindi.", reply_markup=admin_menu())
+
+    media_type = None
+    file_id = None
+    caption = (message.caption or "").strip()
+    if message.video:
+        media_type, file_id = "video", message.video.file_id
+    elif message.document:
+        media_type, file_id = "document", message.document.file_id
+    elif message.audio:
+        media_type, file_id = "audio", message.audio.file_id
+    elif message.animation:
+        media_type, file_id = "animation", message.animation.file_id
+    elif message.photo:
+        media_type, file_id = "photo", message.photo[-1].file_id
+    elif message.voice:
+        media_type, file_id = "voice", message.voice.file_id
+    else:
+        return await message.answer("❌ Qism sifatida video yuboring (yoki video faylni hujjat qilib yuboring). Tugatish: /done · Bekor qilish: /cancel")
+
+    saved = await state.get_data()
+    code = str(saved.get("batch_code", ""))
+    data = load_data()
+    anime = data.get("animes", {}).get(code)
+    if not anime:
+        await state.clear()
+        return await message.answer("❌ Kontent topilmadi. Qaytadan boshlang.", reply_markup=admin_menu())
     season = anime.setdefault("seasons", {}).setdefault("1", {"episodes": {}})
     episodes = season.setdefault("episodes", {})
     numeric = [int(n) for n in episodes if str(n).isdigit()]
     number = max(numeric, default=0) + 1
-    episodes[str(number)] = {"regular": {"chat_id": source_chat, "message_id": source_message}}
-    anime.setdefault("episodes", {})[str(number)] = episodes[str(number)]
+    record = {"file_id": file_id, "media_type": media_type, "caption": caption}
+    episodes[str(number)] = record
+    anime.setdefault("episodes", {})[str(number)] = record
     save_data(data)
     count = int(saved.get("batch_count", 0)) + 1
     await state.update_data(batch_count=count)
@@ -1713,13 +1741,13 @@ async def episode_batch_message(message: Message, state: FSMContext):
             await bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=progress_id,
-                text=(f"🎬 <b>{data['animes'][code]['name']}</b>\n"
-                      f"✅ {count} ta qism saqlandi. Oxirgisi: <b>{number}-qism</b>.\n\n"
-                      "Keyingi qismlarni ketma-ket forward qilishda davom eting.\n"
-                      "Tugatish: /done · Bekor qilish: /cancel")
+                text=(f"🎬 <b>{anime['name']}</b>\n✅ {count} ta qism saqlandi. Oxirgisi: <b>{number}-qism</b>.\n\n"
+                      "Keyingi videolarni shu chatga ketma-ket yuboring.\nTugatish: /done · Bekor qilish: /cancel")
             )
         except Exception:
             pass
+    else:
+        await message.answer(f"✅ {number}-qism saqlandi. Keyingi videoni yuboring yoki /done yozing.")
 
 @dp.callback_query(F.data == "del_anime")
 async def del_anime(call: CallbackQuery, state: FSMContext):
@@ -2015,7 +2043,7 @@ async def appearance_menu(call: CallbackQuery):
         [InlineKeyboardButton(text="♻️ Ranglarni tozalash", callback_data="color_reset")],
         [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
     ])
-    await call.message.answer("🎨 <b>Chiroyli ko‘rinish</b>\nTugma guruhini tanlang, keyin rangini belgilang. Telegram faqat ko‘k, yashil va qizil uslublarni qo‘llasa ko‘rsatadi.", reply_markup=kb)
+    await call.message.answer("🎨 <b>Chiroyli ko‘rinish</b>\nTugma guruhini tanlang, keyin rangini belgilang. Telegram inline tugmalarda faqat standart, ko‘k (primary), yashil (success) va qizil (danger) uslublarni beradi; boshqa rangni kod bilan majburlab bo‘lmaydi.", reply_markup=kb)
     await call.answer()
 
 
