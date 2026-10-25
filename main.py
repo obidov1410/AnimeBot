@@ -340,12 +340,11 @@ def main_menu(user_id=None):
     rows = [
         [InlineKeyboardButton(text="🎬 Kino va serial izlash", callback_data="search_menu")],
         [InlineKeyboardButton(text="📖 Qo'llanma", callback_data="guide")],
-        [InlineKeyboardButton(text="👤 Hisobim", callback_data="account")],
     ]
-    # Owner VIP rejimini yoqqanida foydalanuvchiga eski VIP tugmalari ko'rsatiladi.
     if load_data().get("settings", {}).get("vip_enabled", False):
         rows.insert(1, [InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")])
         rows.insert(2, [InlineKeyboardButton(text="❓ VIP o'zi nima?", callback_data="vip_info")])
+        rows.append([InlineKeyboardButton(text="👤 Hisobim", callback_data="account")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -357,7 +356,6 @@ def main_reply_keyboard():
 def search_menu(user_id=None):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎞 Kino", callback_data="category:movie"), InlineKeyboardButton(text="📺 Serial", callback_data="category:series")],
-        [InlineKeyboardButton(text="🎭 Drama", callback_data="category:drama")],
         [InlineKeyboardButton(text="🍥 Anime", callback_data="category:anime"), InlineKeyboardButton(text="🎨 Multfilm", callback_data="category:cartoon")],
         [InlineKeyboardButton(text="🔢 Kod bo'yicha qidirish", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo'yicha qidirish", callback_data="search_name")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
@@ -372,7 +370,8 @@ def admin_menu(user_id=None):
         perms = {"add_content", "add_episode", "edit_content", "delete_content"}
     rows = []
     if "add_content" in perms:
-        rows.append([InlineKeyboardButton(text="➕ Kino / anime / multik qo'shish", callback_data="admin_add_content")])
+        rows.append([InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="newtype:movie"), InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="newtype:series")])
+        rows.append([InlineKeyboardButton(text="🍥 Anime qo'shish", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm qo'shish", callback_data="newtype:cartoon")])
     if "edit_content" in perms:
         rows.append([InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_media"), InlineKeyboardButton(text="🖼 Posterni o'zgartirish", callback_data="edit_poster")])
         rows.append([InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="rename_code")])
@@ -383,7 +382,8 @@ def admin_menu(user_id=None):
 
 def owner_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Kino / drama qo'shish", callback_data="add_movie"), InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="add_series")],
+        [InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="add_movie"), InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="add_series")],
+        [InlineKeyboardButton(text="🍥 Anime qo'shish", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm qo'shish", callback_data="newtype:cartoon")],
         [InlineKeyboardButton(text="➕ Qism yoki yangi sezon", callback_data="add_episode"), InlineKeyboardButton(text="🗑 Kontent o'chirish", callback_data="del_media")],
         [InlineKeyboardButton(text="✏️ Nom / kodni tahrirlash", callback_data="rename_media"), InlineKeyboardButton(text="🖼 Posterni tahrirlash", callback_data="edit_poster")],
         [InlineKeyboardButton(text="👤 Admin qo'shish", callback_data="add_admin"), InlineKeyboardButton(text="➖ Admin o'chirish", callback_data="del_admin")],
@@ -393,7 +393,7 @@ def owner_menu():
         [InlineKeyboardButton(text="💾 Zaxira olish", callback_data="owner_backup"), InlineKeyboardButton(text="♻️ Zaxirani tiklash", callback_data="owner_restore_help")],
         [InlineKeyboardButton(text="🛠 Texnik tanaffus: holat", callback_data="owner_maintenance")],
         [InlineKeyboardButton(text=("💎 VIP: O'CHIRISH" if load_data().get("settings", {}).get("vip_enabled", False) else "💎 VIP: YOQISH"), callback_data="owner_vip")],
-        [InlineKeyboardButton(text="👤 Hisobim", callback_data="account")],
+        [InlineKeyboardButton(text="📣 Hammaga xabar yuborish", callback_data="broadcast")],
         [InlineKeyboardButton(text="⚙️ Bot sozlamalari", callback_data="owner_settings")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
         [InlineKeyboardButton(text=("📣 Yangi kontent xabari: YOQILGAN" if load_data().get("settings", {}).get("notify_new_content", True) else "📣 Yangi kontent xabari: O‘CHIRILGAN"), callback_data="owner_notify_toggle")],
@@ -630,8 +630,6 @@ async def owner_settings_callback(call: CallbackQuery):
         [InlineKeyboardButton(text=f"⏳ VIP oy davomiyligi: {cfg.get('vip_duration_days', 30)} kun", callback_data="setcfg:vip_duration_days")],
         [InlineKeyboardButton(text=f"🎬 Erta ko‘rish: {cfg.get('early_view_days', 1)} kun", callback_data="setcfg:early_view_days")],
         [InlineKeyboardButton(text=f"💬 To‘lov admini: @{str(cfg.get('admin_contact', 'obidov_xz')).lstrip('@')}", callback_data="setcfg:admin_contact")],
-        [InlineKeyboardButton(text=f"👥 Oddiy baza: {cfg.get('ordinary_base_status', 'sozlanmagan')}", callback_data="setcfg:ordinary_base_status")],
-        [InlineKeyboardButton(text=f"👑 VIP baza: {cfg.get('vip_base_status', 'sozlanmagan')}", callback_data="setcfg:vip_base_status")],
         [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
     ])
     await call.message.answer("⚙️ <b>Bot sozlamalari</b>\nKerakli sozlamani tanlab qiymatini o‘zgartiring. Eski umumiy baza olib tashlangan.", reply_markup=kb)
@@ -650,8 +648,6 @@ async def owner_setting_start(call: CallbackQuery, state: FSMContext):
         "vip_max_months": "VIP uchun ruxsat etilgan maksimal oy sonini yuboring:",
         "vip_duration_days": "VIP obunasining bir oyi necha kun bo‘lishini yuboring:",
         "early_view_days": "VIP erta ko‘rish necha kun oldin bo‘lishini yuboring:",
-        "ordinary_base_status": "Oddiy baza holatini yuboring (masalan: sozlanmagan yoki @kanal):",
-        "vip_base_status": "VIP baza holatini yuboring (masalan: sozlanmagan yoki @kanal):",
     }
     if key not in prompts:
         return await call.answer("Noma'lum sozlama", show_alert=True)
@@ -685,10 +681,6 @@ async def owner_setting_save(message: Message, state: FSMContext):
         value = raw
         if not value.startswith("@") or len(value) < 2 or " " in value:
             return await message.answer("Username @ bilan boshlansin, masalan @AnimBot_Admin. Qayta yuboring:")
-    elif key in {"ordinary_base_status", "vip_base_status"}:
-        value = raw
-        if not value:
-            return await message.answer("Qiymat bo‘sh bo‘lmasin:")
     elif key in {"vip_max_months", "vip_duration_days", "early_view_days", "vip_month_price", "referral_reward"}:
         try: value = int(raw)
         except ValueError: return await message.answer("Faqat raqam yuboring:")
@@ -702,7 +694,7 @@ async def owner_setting_save(message: Message, state: FSMContext):
     data.setdefault("settings", {})[key] = value
     save_data(data)
     await state.clear()
-    labels = {"admin_contact": "To‘lov admini", "vip_month_price": "VIP oylik narxi", "referral_reward": "Referal mukofoti", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish", "ordinary_base_status": "Oddiy baza", "vip_base_status": "VIP baza"}
+    labels = {"admin_contact": "To‘lov admini", "vip_month_price": "VIP oylik narxi", "referral_reward": "Referal mukofoti", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish"}
     await message.answer(f"✅ {labels.get(key, key)} yangilandi: <b>{value}</b>\nO‘zgarish darhol kuchga kirdi.", reply_markup=owner_menu())
 
 
@@ -1011,7 +1003,7 @@ async def search_menu_open(call: CallbackQuery):
 
 @dp.callback_query(F.data == "guide")
 async def guide(call: CallbackQuery):
-    text = "📖 <b>Qo'llanma</b>\n\n1️⃣ Kerakli bo'limni tanlang: kino, serial yoki drama.\n2️⃣ Kod yoki nom orqali qidiring; nom yozib yuborilgach o'xshash natijalar tugma bo'lib chiqadi.\n3️⃣ Kontentni oching — mavjud bo'lsa 1-qismdan boshlang, pastdagi ⬅️/➡️ tugmalari bilan qismlar almashadi.\n\n🛑 Orqaga tugmasi oldingi menyuga qaytaradi."
+    text = "📖 <b>Qo'llanma</b>\n\n1️⃣ Kerakli bo'limni tanlang: kino yoki serial.\n2️⃣ Kod yoki nom orqali qidiring; nom yozib yuborilgach o'xshash natijalar tugma bo'lib chiqadi.\n3️⃣ Kontentni oching — mavjud bo'lsa 1-qismdan boshlang, pastdagi ⬅️/➡️ tugmalari bilan qismlar almashadi.\n\n🛑 Orqaga tugmasi oldingi menyuga qaytaradi."
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛑 Orqaga", callback_data="home")]])
     try:
         await call.message.edit_text(text, reply_markup=kb)
@@ -1163,7 +1155,7 @@ async def catalog_send_part(call: CallbackQuery):
 async def search_name_start(call: CallbackQuery, state: FSMContext):
     await state.update_data(search_filter="all")
     await state.set_state(Form.search_name)
-    await call.message.answer("🔤 Qidirilayotgan kino, serial yoki drama nomini yozing. Har safar yuborganingizda mos nomlar tanlash uchun chiqadi:")
+    await call.message.answer("🔤 Qidirilayotgan kino yoki serial nomini yozing. Har safar yuborganingizda mos nomlar tanlash uchun chiqadi:")
     await call.answer()
 
 
@@ -1499,7 +1491,7 @@ async def add_series(call: CallbackQuery, state: FSMContext):
     if not has_permission(call.from_user.id, "add_content"):
         return await call.answer("⛔ Sizda kontent qo'shish huquqi yo'q.", show_alert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📺 Serial", callback_data="newtype:series"), InlineKeyboardButton(text="🎭 Drama", callback_data="newtype:drama")],
+        [InlineKeyboardButton(text="📺 Serial", callback_data="newtype:series")],
         [InlineKeyboardButton(text="🍥 Anime", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm", callback_data="newtype:cartoon")],
     ])
     await call.message.answer("Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
@@ -1879,7 +1871,7 @@ async def admin_permission_toggle(call: CallbackQuery):
 async def del_media(call: CallbackQuery, state: FSMContext):
     if not has_permission(call.from_user.id, "delete_content"):
         return await call.answer("⛔ Sizda o'chirish huquqi yo'q.", show_alert=True)
-    await ask(call, state, Form.delete_code, "O'chiriladigan kino/serial/drama kodini yuboring:")
+    await ask(call, state, Form.delete_code, "O'chiriladigan kino yoki serial kodini yuboring:")
 
 
 @dp.message(Form.delete_code)
