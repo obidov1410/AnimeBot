@@ -168,7 +168,7 @@ def default_data():
         "channel_catalog": {},
         "users": {},
         "banned_users": [],
-        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "maintenance": False, "vip_enabled": False}
+        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "maintenance": False, "vip_enabled": False, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
     }
 
 
@@ -340,6 +340,7 @@ def main_menu(user_id=None):
     rows = [
         [InlineKeyboardButton(text="🎬 Kino va serial izlash", callback_data="search_menu")],
         [InlineKeyboardButton(text="📖 Qo'llanma", callback_data="guide")],
+        [InlineKeyboardButton(text="👤 Hisobim", callback_data="account")],
     ]
     # Owner VIP rejimini yoqqanida foydalanuvchiga eski VIP tugmalari ko'rsatiladi.
     if load_data().get("settings", {}).get("vip_enabled", False):
@@ -392,7 +393,10 @@ def owner_menu():
         [InlineKeyboardButton(text="💾 Zaxira olish", callback_data="owner_backup"), InlineKeyboardButton(text="♻️ Zaxirani tiklash", callback_data="owner_restore_help")],
         [InlineKeyboardButton(text="🛠 Texnik tanaffus: holat", callback_data="owner_maintenance")],
         [InlineKeyboardButton(text=("💎 VIP: O'CHIRISH" if load_data().get("settings", {}).get("vip_enabled", False) else "💎 VIP: YOQISH"), callback_data="owner_vip")],
+        [InlineKeyboardButton(text="👤 Hisobim", callback_data="account")],
+        [InlineKeyboardButton(text="⚙️ Bot sozlamalari", callback_data="owner_settings")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
+        [InlineKeyboardButton(text=("📣 Yangi kontent xabari: YOQILGAN" if load_data().get("settings", {}).get("notify_new_content", True) else "📣 Yangi kontent xabari: O‘CHIRILGAN"), callback_data="owner_notify_toggle")],
     ])
 
 
@@ -620,9 +624,17 @@ async def owner_settings_callback(call: CallbackQuery):
         return await call.answer("Faqat owner uchun", show_alert=True)
     cfg = load_data().get("settings", {})
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"👥 Referal mukofoti: {cfg.get('referral_reward', 5000)} so‘m", callback_data="setcfg:referral_reward")],
+        [InlineKeyboardButton(text=f"👑 VIP 1 oy narxi: {cfg.get('vip_month_price', 15000)} so‘m", callback_data="setcfg:vip_month_price")],
+        [InlineKeyboardButton(text=f"📅 VIP maksimal muddati: {cfg.get('vip_max_months', 6)} oy", callback_data="setcfg:vip_max_months")],
+        [InlineKeyboardButton(text=f"⏳ VIP oy davomiyligi: {cfg.get('vip_duration_days', 30)} kun", callback_data="setcfg:vip_duration_days")],
+        [InlineKeyboardButton(text=f"🎬 Erta ko‘rish: {cfg.get('early_view_days', 1)} kun", callback_data="setcfg:early_view_days")],
+        [InlineKeyboardButton(text=f"💬 To‘lov admini: @{str(cfg.get('admin_contact', 'obidov_xz')).lstrip('@')}", callback_data="setcfg:admin_contact")],
+        [InlineKeyboardButton(text=f"👥 Oddiy baza: {cfg.get('ordinary_base_status', 'sozlanmagan')}", callback_data="setcfg:ordinary_base_status")],
+        [InlineKeyboardButton(text=f"👑 VIP baza: {cfg.get('vip_base_status', 'sozlanmagan')}", callback_data="setcfg:vip_base_status")],
         [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
     ])
-    await call.message.answer("⚙️ <b>Bot sozlamalari</b>\nBarcha kontent barcha foydalanuvchilarga bir vaqtda ochiladi.", reply_markup=kb)
+    await call.message.answer("⚙️ <b>Bot sozlamalari</b>\nKerakli sozlamani tanlab qiymatini o‘zgartiring. Eski umumiy baza olib tashlangan.", reply_markup=kb)
     await call.answer()
 
 
@@ -632,8 +644,14 @@ async def owner_setting_start(call: CallbackQuery, state: FSMContext):
         return await call.answer("Faqat owner uchun", show_alert=True)
     key = call.data.split(":", 1)[1]
     prompts = {
-        "admin_contact": "To'lov uchun admin username yuboring, masalan @AnimBot_Admin:",
-        "catalog_channel_id": "Qismlar olinadigan kanalning @username yoki -100... ID sini yuboring. Bot shu kanalda administrator bo'lishi shart:",
+        "admin_contact": "To‘lov adminining username sini yuboring, masalan @obidov_xz:",
+        "vip_month_price": "VIP obunasining 1 oylik narxini so‘mda yuboring:",
+        "referral_reward": "Har bir referal uchun beriladigan mukofotni so‘mda yuboring:",
+        "vip_max_months": "VIP uchun ruxsat etilgan maksimal oy sonini yuboring:",
+        "vip_duration_days": "VIP obunasining bir oyi necha kun bo‘lishini yuboring:",
+        "early_view_days": "VIP erta ko‘rish necha kun oldin bo‘lishini yuboring:",
+        "ordinary_base_status": "Oddiy baza holatini yuboring (masalan: sozlanmagan yoki @kanal):",
+        "vip_base_status": "VIP baza holatini yuboring (masalan: sozlanmagan yoki @kanal):",
     }
     if key not in prompts:
         return await call.answer("Noma'lum sozlama", show_alert=True)
@@ -667,10 +685,16 @@ async def owner_setting_save(message: Message, state: FSMContext):
         value = raw
         if not value.startswith("@") or len(value) < 2 or " " in value:
             return await message.answer("Username @ bilan boshlansin, masalan @AnimBot_Admin. Qayta yuboring:")
-    elif key == "catalog_channel_id":
+    elif key in {"ordinary_base_status", "vip_base_status"}:
         value = raw
-        if not ((value.startswith("@") and len(value) > 1 and " " not in value) or (value.startswith("-100") and value[1:].isdigit())):
-            return await message.answer("Kanal @username yoki -100... ID ko'rinishida bo'lsin. Qayta yuboring:")
+        if not value:
+            return await message.answer("Qiymat bo‘sh bo‘lmasin:")
+    elif key in {"vip_max_months", "vip_duration_days", "early_view_days", "vip_month_price", "referral_reward"}:
+        try: value = int(raw)
+        except ValueError: return await message.answer("Faqat raqam yuboring:")
+        if value < 0: return await message.answer("Qiymat manfiy bo‘lishi mumkin emas:")
+        if key in {"vip_max_months", "vip_duration_days"} and value < 1:
+            return await message.answer("Bu qiymat kamida 1 bo‘lishi kerak:")
     else:
         await state.clear()
         return await message.answer("Sozlama topilmadi.")
@@ -678,8 +702,8 @@ async def owner_setting_save(message: Message, state: FSMContext):
     data.setdefault("settings", {})[key] = value
     save_data(data)
     await state.clear()
-    labels = {"catalog_channel_id": "Umumiy baza kanali"}
-    await message.answer(f"✅ {labels[key]} yangilandi: <b>{value}</b>\nO'zgarish darhol kuchga kirdi.", reply_markup=owner_menu())
+    labels = {"admin_contact": "To‘lov admini", "vip_month_price": "VIP oylik narxi", "referral_reward": "Referal mukofoti", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish", "ordinary_base_status": "Oddiy baza", "vip_base_status": "VIP baza"}
+    await message.answer(f"✅ {labels.get(key, key)} yangilandi: <b>{value}</b>\nO‘zgarish darhol kuchga kirdi.", reply_markup=owner_menu())
 
 
 @dp.callback_query(F.data == "manage_users")
@@ -822,17 +846,25 @@ async def owner_vip_callback(call: CallbackQuery):
 async def vip_info_callback(call: CallbackQuery):
     cfg = load_data().get("settings", {})
     if not cfg.get("vip_enabled", False) and not is_owner(call.from_user.id):
-        return await call.answer("VIP hozircha o'chirilgan.", show_alert=True)
-    text = ("💎 <b>VIP nima?</b>\n\nVIP — bot egasi taklif qiladigan qo'shimcha obuna. "
-            "VIP olish shartlari va to'lovini kelishish uchun admin bilan bog'laning.")
+        return await call.answer("VIP hozircha o‘chirilgan.", show_alert=True)
+    price = int(cfg.get("vip_month_price", 15000) or 15000)
+    text = (
+        "👑 <b>VIP — tomoshadan ko‘proq zavq oling!</b>\n\n"
+        "VIP obunasi orqali sevimli anime, serial va filmlaringizni yanada qulayroq tomosha qiling! 💎\n\n"
+        "✨ <b>VIP imkoniyatlari:</b>\n\n"
+        "🚀 3 kun oldin tomosha qilish\n"
+        "🎬 720p–1080p sifatdagi videolar (manbada mavjud bo‘lsa)\n"
+        "🔓 Majburiy kanallarga obunasiz kirish\n"
+        "📤 Kontentni ulashish imkoniyati\n"
+        "♥️ Sevimlilar va ▶️ Davom ettirish\n\n"
+        f"💎 VIP narxi: oyiga {price:,} so‘m".replace(",", " ")
+    )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
     ])
-    try:
-        await call.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await call.message.answer(text, reply_markup=kb)
+    try: await call.message.edit_text(text, reply_markup=kb)
+    except Exception: await call.message.answer(text, reply_markup=kb)
     await call.answer()
 
 
@@ -841,7 +873,7 @@ async def vip_buy_callback(call: CallbackQuery):
     cfg = load_data().get("settings", {})
     if not cfg.get("vip_enabled", False) and not is_owner(call.from_user.id):
         return await call.answer("VIP hozircha o'chirilgan.", show_alert=True)
-    contact = str(cfg.get("admin_contact", ADMIN_CONTACT)).lstrip("@")
+    contact = str(cfg.get("admin_contact", "obidov_xz")).lstrip("@")
     text = "💎 <b>VIP olish</b>\n\nVIP obunasini faollashtirish uchun admin bilan bog'laning."
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", url=f"https://t.me/{contact}")],
@@ -1604,6 +1636,8 @@ async def notify_content_added(code: str, item: dict):
             f"🔢 Kodi: <code>{code}</code>\n\n"
             "Tomosha qilish uchun quyidagi tugmani bosing!")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Tomosha qilish", callback_data=f"show:{code}")]])
+    if not data.get("settings", {}).get("notify_new_content", True):
+        return
     for uid in list(data.get("users", {})):
         try:
             await bot.send_message(int(uid), text, reply_markup=kb)
@@ -2103,21 +2137,58 @@ async def start_text_save(message: Message, state: FSMContext):
     await message.answer("✅ /start xabari o'zgartirildi.", reply_markup=admin_menu(message.from_user.id))
 
 
+@dp.callback_query(F.data == "account")
+async def account_callback(call: CallbackQuery):
+    data = load_data()
+    user = data.setdefault("users", {}).get(str(call.from_user.id), {})
+    balance = int(user.get("balance", 0) or 0)
+    vip_until = int(user.get("vip_until", 0) or 0)
+    vip_status = "✅ Ha" if vip_until > now_ts() else "❌ Yo‘q"
+    vip_date = fmt_date(vip_until) if vip_until > now_ts() else "—"
+    text = (f"👤 <b>Hisobim</b>\n\n🆔 ID: <code>{call.from_user.id}</code>\n"
+            f"💰 Balans: <b>{balance:,} so‘m</b>\n👑 VIP obunachi: <b>{vip_status}</b>\n📅 VIP muddati: <b>{vip_date}</b>".replace(",", " "))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")], [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
+    try: await call.message.edit_text(text, reply_markup=kb)
+    except Exception: await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "owner_notify_toggle")
+async def owner_notify_toggle(call: CallbackQuery):
+    if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data(); cfg = data.setdefault("settings", {})
+    cfg["notify_new_content"] = not bool(cfg.get("notify_new_content", True)); save_data(data)
+    await call.message.answer("📣 Yangi kontent xabarlari " + ("yoqildi." if cfg["notify_new_content"] else "o‘chirildi."), reply_markup=owner_menu())
+    await call.answer()
+
+
 @dp.callback_query(F.data == "stats")
 async def stats(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return await call.answer("Faqat adminlar uchun", show_alert=True)
     data = load_data()
     users = list(data.get("users", {}).values())
-    cutoff = now_ts() - 30 * 24 * 60 * 60
-    active = sum(1 for u in users if int(u.get("last_seen", u.get("joined_at", 0)) or 0) >= cutoff)
-    inactive = max(0, len(users) - active)
-    total_episodes = sum(sum(len(season.get("episodes", {})) for season in (a.get("seasons") or {}).values()) if a.get("seasons") else len(a.get("episodes", {})) for a in data["medias"].values())
+    now = now_ts()
+    def seen_in(days):
+        return sum(1 for u in users if int(u.get("last_seen", u.get("joined_at", 0)) or 0) >= now - days * 86400)
+    def joined_in(days):
+        return sum(1 for u in users if int(u.get("joined_at", 0) or 0) >= now - days * 86400)
+    active30 = seen_in(30)
+    inactive = max(0, len(users) - active30)
+    medias = list(data.get("medias", {}).values())
+    movie_count = sum(1 for m in medias if m.get("media_type") == "movie")
+    anime_count = sum(1 for m in medias if m.get("media_type") == "anime")
+    cartoon_count = sum(1 for m in medias if m.get("media_type") == "cartoon")
+    series_count = sum(1 for m in medias if m.get("media_type") in {"series", "drama"})
+    downloads = data.get("downloads", {})
+    def downloads_in(days):
+        return sum(1 for t in downloads.values() if isinstance(t, (int, float)) and t >= now - days * 86400) if isinstance(downloads, dict) else 0
     await call.message.answer(
-        f"📊 <b>Statistika</b>\n👥 Jami foydalanuvchilar: {len(users)}\n"
-        f"🟢 Faol (oxirgi 30 kun): {active}\n⚫ Faol emas (30 kundan beri): {inactive}\n"
-        f"🎬 Kino/serial: {len(data['medias'])}\n🎞 Qismlar: {total_episodes}\n"
-        f"👑 Adminlar: {len(data['admins'])}\n📢 Kanallar: {len(data['channels'])}"
+        f"📊 <b>Statistika</b>\n• Obunachilar soni: {len(users)} ta\n• Faol obunachilar: {active30} ta\n• Tark etganlar: {inactive} ta\n\n"
+        f"📈 <b>Obunachilar qo‘shilishi</b>\n• Oxirgi 24 soat: +{joined_in(1)} obunachi\n• Oxirgi 7 kun: +{joined_in(7)} obunachi\n• Oxirgi 30 kun: +{joined_in(30)} obunachi\n\n"
+        f"📊 <b>Faollik</b>\n• Oxirgi 24 soatda faol: {seen_in(1)} ta\n• Oxirgi 7 kun faol: {seen_in(7)} ta\n• Oxirgi 30 kun faol: {active30} ta\n\n"
+        f"📥 <b>Yuklanishlar</b>\n• Oxirgi 24 soat: {downloads_in(1)} ta\n• Oxirgi 7 kun: {downloads_in(7)} ta\n• Oxirgi 30 kun: {downloads_in(30)} ta\n\n"
+        f"🎬 Kinolar soni: {movie_count} ta\n🍥 Anime: {anime_count} ta\n🎨 Multfilm: {cartoon_count} ta\n📺 Serial/drama: {series_count} ta"
     )
     await call.answer()
 
