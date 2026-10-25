@@ -9,10 +9,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as TelegramInlineKeyboardButton, ReplyKeyboardRemove, BufferedInputFile
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as TelegramInlineKeyboardButton, ReplyKeyboardRemove, BufferedInputFile, BotCommand
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -78,11 +78,10 @@ else:
     # OWNER_ID bo'sh qolgan bo'lsa, ADMIN_ID dagi birinchi ID egasi sifatida olinadi.
     OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
 DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
+BACKUP_CHANNEL_ID = os.getenv("BACKUP_CHANNEL_ID", "").strip()
 ADMIN_CONTACT = "@AnimBot_Admin"
 # media postlari saqlanadigan kanal ID sini STORAGE_CHANNEL_ID environment variable orqali berish mumkin.
 CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "").strip()
-# Telegramdagi zaxira kanali; bot kanal administratori bo‘lishi kerak.
-BACKUP_CHANNEL_ID = os.getenv("BACKUP_CHANNEL_ID", "").strip()
 # =================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -136,89 +135,26 @@ class StyledBot(Bot):
 bot = StyledBot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-
-MAINTENANCE_WARNING = (
-    "🛠 <b>Bot vaqtincha yangilanmoqda.</b>\n\n"
-    "Iltimos, yangilanish tugaguncha tugmalarni bosmang va kino nomi yoki kodini yubormang.\n"
-    "Xizmat tiklangach, botdan yana foydalanishingiz mumkin. Rahmat! 🎬"
-)
-
-
-class MaintenanceMiddleware(BaseMiddleware):
-    """Yangilanish vaqtida barcha foydalanuvchi xabarlari va tugmalarini ushlab qoladi."""
+class MaintenanceMiddleware:
+    """Texnik tanaffusda ownerdan boshqalarning so'rovlarini to'xtatadi."""
     async def __call__(self, handler, event, data):
-        try:
-            state = load_data().get("settings", {}).get("maintenance", False)
-        except Exception:
-            state = False
-        if not state:
-            return await handler(event, data)
         user = getattr(event, "from_user", None)
-        uid = getattr(user, "id", 0) if user else 0
-        if isinstance(event, Message) and uid == OWNER_ID and event.text:
-            if event.text.strip().split()[0].split("@")[0] in ("/maintenance_off", "/maintenance_status", "/backup"):
-                return await handler(event, data)
-        if isinstance(event, CallbackQuery):
-            try:
-                await event.answer("Bot yangilanmoqda. Biroz kuting.", show_alert=True)
-            except Exception:
-                pass
-            if event.message:
+        if user and not is_owner(user.id):
+            cfg = load_data().get("settings", {})
+            if cfg.get("maintenance", False):
+                message = getattr(event, "message", None) or event
                 try:
-                    await event.message.answer(MAINTENANCE_WARNING)
+                    if isinstance(event, CallbackQuery):
+                        await event.answer("🛠 Botda texnik ishlar ketmoqda. Keyinroq urinib ko'ring.", show_alert=True)
+                    elif isinstance(event, Message):
+                        await event.answer("🛠 <b>Texnik tanaffus</b>\nBot yangilanmoqda. Iltimos, keyinroq urinib ko'ring.")
                 except Exception:
                     pass
-            return None
-        if isinstance(event, Message):
-            try:
-                await event.answer(MAINTENANCE_WARNING)
-            except Exception:
-                pass
-            return None
-        return None
-
+                return None
+        return await handler(event, data)
 
 dp.message.outer_middleware(MaintenanceMiddleware())
 dp.callback_query.outer_middleware(MaintenanceMiddleware())
-
-
-async def send_backup(bot_instance, reason="Avtomatik zaxira"):
-    if not BACKUP_CHANNEL_ID or not DATA_FILE.exists():
-        return False
-    try:
-        raw = DATA_FILE.read_bytes()
-        parsed = json.loads(raw.decode("utf-8"))
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("medias", {}), dict):
-            logging.error("Zaxira bekor qilindi: data.json tuzilmasi noto‘g‘ri")
-            return False
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
-        document = BufferedInputFile(raw, filename=f"kino_bot_backup_{stamp}.json")
-        await bot_instance.send_document(chat_id=int(BACKUP_CHANNEL_ID), document=document,
-            caption=f"📦 {reason}\nVaqt: {stamp}\nMedialar: {len(parsed.get('medias', {}))}\nBu faylni o‘chirmang.")
-        logging.info("Telegram zaxira kanali yangilandi")
-        return True
-    except Exception:
-        logging.exception("Telegram kanaliga zaxira yuborilmadi")
-        return False
-
-
-async def backup_watcher():
-    last_signature = None
-    while True:
-        await asyncio.sleep(60)
-        try:
-            if not BACKUP_CHANNEL_ID or not DATA_FILE.exists():
-                continue
-            stat = DATA_FILE.stat()
-            signature = (stat.st_mtime_ns, stat.st_size)
-            if signature != last_signature:
-                await asyncio.sleep(3)
-                if await send_backup(bot, "Avtomatik zaxira"):
-                    last_signature = signature
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logging.exception("Zaxira kuzatuvchisida xato")
 
 
 def default_data():
@@ -230,7 +166,7 @@ def default_data():
         "channel_catalog": {},
         "users": {},
         "banned_users": [],
-        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}}
+        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "maintenance": False, "vip_enabled": False}
     }
 
 
@@ -250,10 +186,7 @@ def load_data():
         save_data(default_data())
     try:
         data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        # Mavjud fayl buzilgan bo‘lsa, bo‘sh baza bilan davom etib uni ustidan yozib yubormaymiz.
-        if DATA_FILE.exists():
-            raise RuntimeError(f"{DATA_FILE} o‘qilmadi yoki JSON buzilgan; ma’lumotni yo‘qotmaslik uchun bot to‘xtatildi") from exc
+    except (json.JSONDecodeError, OSError):
         data = default_data()
     for key, value in default_data().items():
         data.setdefault(key, value)
@@ -417,6 +350,7 @@ def search_menu(user_id=None):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎞 Kino", callback_data="category:movie"), InlineKeyboardButton(text="📺 Serial", callback_data="category:series")],
         [InlineKeyboardButton(text="🎭 Drama", callback_data="category:drama")],
+        [InlineKeyboardButton(text="🍥 Anime", callback_data="category:anime"), InlineKeyboardButton(text="🎨 Multfilm", callback_data="category:cartoon")],
         [InlineKeyboardButton(text="🔢 Kod bo'yicha qidirish", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo'yicha qidirish", callback_data="search_name")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
     ])
@@ -449,7 +383,10 @@ def owner_menu():
         [InlineKeyboardButton(text="🔐 Admin huquqlarini sozlash", callback_data="admin_permissions")],
         [InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="add_channel"), InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="del_channel")],
         [InlineKeyboardButton(text="🎨 Tugma ranglari", callback_data="appearance")],
-        [InlineKeyboardButton(text="📚 Baza kanalini belgilash", callback_data="setcfg:catalog_channel_id")],
+        [InlineKeyboardButton(text="💾 Zaxira olish", callback_data="owner_backup"), InlineKeyboardButton(text="♻️ Zaxirani tiklash", callback_data="owner_restore_help")],
+        [InlineKeyboardButton(text="🛠 Texnik tanaffus: holat", callback_data="owner_maintenance")],
+        [InlineKeyboardButton(text="💎 VIP: yoqish/o'chirish", callback_data="owner_vip")],
+        [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
     ])
 
 
@@ -522,7 +459,7 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
 
 def media_caption(code: str, media: dict) -> str:
     description = (media.get("description") or "").strip()
-    kind = {"movie":"🎞 Kino", "series":"📺 Serial", "drama":"🎭 Drama"}.get(media.get("media_type"), "🎬 Kontent")
+    kind = {"movie":"🎞 Kino", "series":"📺 Serial", "drama":"🎭 Drama", "anime":"🍥 Anime", "cartoon":"🎨 Multfilm"}.get(media.get("media_type"), "🎬 Kontent")
     seasons = media.get("seasons") or {"1": {"episodes": media.get("episodes", {})}}
     total_episodes = sum(len(value.get("episodes", {})) for value in seasons.values())
     base = f"{kind}: <b>{media['name']}</b>\n\n🔢 Kod: <code>{code}</code>\n📺 Fasllar: {len(seasons)}\n🎞 Qismlar: {total_episodes}"
@@ -560,6 +497,7 @@ async def send_media_card(chat_id: int, code: str, media: dict):
 
 
 class Form(StatesGroup):
+    owner_restore_file = State()
     search_code = State()
     search_name = State()
     media_code = State()
@@ -676,7 +614,6 @@ async def owner_settings_callback(call: CallbackQuery):
         return await call.answer("Faqat owner uchun", show_alert=True)
     cfg = load_data().get("settings", {})
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📚 Umumiy baza: {cfg.get('catalog_channel_id') or 'sozlanmagan'}", callback_data="setcfg:catalog_channel_id")],
         [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
     ])
     await call.message.answer("⚙️ <b>Bot sozlamalari</b>\nBarcha kontent barcha foydalanuvchilarga bir vaqtda ochiladi.", reply_markup=kb)
@@ -747,6 +684,77 @@ async def manage_users_callback(call: CallbackQuery, state: FSMContext):
     await call.message.answer("👥 <b>Obunachilarni boshqarish</b>\nBoshqariladigan foydalanuvchi ID sini yuboring:")
     await call.answer()
 
+
+@dp.callback_query(F.data == "owner_backup")
+async def owner_backup_callback(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data()
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    doc = BufferedInputFile(payload, filename=f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    try:
+        if BACKUP_CHANNEL_ID:
+            await bot.send_document(BACKUP_CHANNEL_ID, doc, caption="🤖 Bot avtomatik zaxirasi")
+            await call.message.answer("✅ Zaxira JSON fayli BACKUP_CHANNEL_ID kanaliga yuborildi.", reply_markup=owner_menu())
+        else:
+            await bot.send_document(call.from_user.id, doc, caption="💾 Bot zaxirasi. Xavfsiz joyda saqlang.")
+            await call.message.answer("✅ Zaxira sizga shaxsiy xabarda yuborildi. Renderda BACKUP_CHANNEL_ID kiritsangiz, kanalga ham yuboriladi.", reply_markup=owner_menu())
+    except Exception as exc:
+        await call.message.answer(f"❌ Zaxira yuborilmadi. Kanal IDsi va bot adminligini tekshiring. ({type(exc).__name__})")
+    await call.answer()
+
+@dp.callback_query(F.data == "owner_restore_help")
+async def owner_restore_help(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    await state.set_state(Form.owner_restore_file)
+    await call.message.answer("♻️ Tiklash uchun oldin olingan bot_backup_*.json faylini shu chatga hujjat qilib yuboring. Joriy baza zaxira bilan almashtiriladi. Bekor qilish: /cancel")
+    await call.answer()
+
+@dp.message(Form.owner_restore_file)
+async def owner_restore_file(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    if not message.document or not message.document.file_name.lower().endswith('.json'):
+        return await message.answer("❌ JSON zaxira faylini hujjat sifatida yuboring.")
+    try:
+        file = await bot.get_file(message.document.file_id)
+        stream = await bot.download_file(file.file_path)
+        raw = stream.read()
+        restored = json.loads(raw.decode('utf-8'))
+        if not isinstance(restored, dict) or not isinstance(restored.get('medias', {}), dict):
+            raise ValueError('backup structure')
+        base = default_data()
+        for key, value in base.items():
+            restored.setdefault(key, value)
+        restored.setdefault("settings", {})
+        for key, value in base["settings"].items():
+            restored["settings"].setdefault(key, value)
+        save_data(restored)
+        await state.clear()
+        await message.answer("✅ Zaxira tiklandi. Bot ma'lumotlari zaxira faylidagi holatga qaytarildi.", reply_markup=owner_menu())
+    except Exception as exc:
+        await message.answer(f"❌ Zaxirani o'qib bo'lmadi: {type(exc).__name__}. Fayl to'g'ri backup JSON ekanini tekshiring.")
+
+@dp.callback_query(F.data == "owner_maintenance")
+async def owner_maintenance_callback(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data(); cfg = data.setdefault("settings", {})
+    cfg["maintenance"] = not bool(cfg.get("maintenance", False)); save_data(data)
+    status = "YOQILDI" if cfg["maintenance"] else "O'CHIRILDI"
+    await call.message.answer(f"🛠 Texnik tanaffus {status}.", reply_markup=owner_menu())
+    await call.answer()
+
+@dp.callback_query(F.data == "owner_vip")
+async def owner_vip_callback(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data(); cfg = data.setdefault("settings", {})
+    cfg["vip_enabled"] = not bool(cfg.get("vip_enabled", False)); save_data(data)
+    status = "YOQILDI" if cfg["vip_enabled"] else "O'CHIRILDI"
+    await call.message.answer(f"💎 VIP rejimi {status}.", reply_markup=owner_menu())
+    await call.answer()
 
 @dp.callback_query(F.data == "admin_home")
 async def admin_home_callback(call: CallbackQuery):
@@ -823,6 +831,18 @@ async def user_ban_callback(call: CallbackQuery):
 
 
 
+
+@dp.message(Command("backup"))
+async def backup_command(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("⛔ Bu buyruq faqat owner uchun.")
+    payload = json.dumps(load_data(), ensure_ascii=False, indent=2).encode("utf-8")
+    doc = BufferedInputFile(payload, filename=f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    if BACKUP_CHANNEL_ID:
+        await bot.send_document(BACKUP_CHANNEL_ID, doc, caption="🤖 Bot zaxirasi")
+        await message.answer("✅ Zaxira kanalga yuborildi.")
+    else:
+        await message.answer_document(doc, caption="💾 Bot zaxirasi")
 
 @dp.message(Command("admin"))
 async def admin_command(message: Message):
@@ -1019,7 +1039,7 @@ async def search_name_start(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("category:"))
 async def category_search_start(call: CallbackQuery, state: FSMContext):
     media_type = call.data.split(":", 1)[1]
-    labels = {"movie":"kino", "series":"serial", "drama":"drama"}
+    labels = {"movie":"kino", "series":"serial", "drama":"drama", "anime":"anime", "cartoon":"multfilm"}
     await state.update_data(search_filter=media_type)
     await state.set_state(Form.search_name)
     await call.message.answer(f"🔎 {labels.get(media_type, 'kontent').capitalize()} bo'limi. Nomini yozing — mos kelgan nomlar tanlash uchun chiqadi:")
@@ -1037,7 +1057,7 @@ async def search_name_result(message: Message, state: FSMContext):
     media_filter = saved.get("search_filter", "all")
     data = load_data()
     matches = [(str(code), item) for code, item in data.get("medias", {}).items()
-               if item.get("media_type", "series") in {"movie", "series", "drama"}
+               if item.get("media_type", "series") in {"movie", "series", "drama", "anime", "cartoon"}
                and query in item.get("name", "").casefold()
                and (media_filter == "all" or item.get("media_type", "series") == media_filter)
                and media_available_for_user(message.from_user.id, item, data)]
@@ -1047,7 +1067,7 @@ async def search_name_result(message: Message, state: FSMContext):
         return await message.answer("❌ Mos nom topilmadi. Boshqa nom yoki qismini yozib ko'ring:", reply_markup=search_menu(message.from_user.id))
     rows = []
     for code, item in matches[:40]:
-        icon = {"movie":"🎞", "series":"📺", "drama":"🎭"}.get(item.get("media_type"), "🎬")
+        icon = {"movie":"🎞", "series":"📺", "drama":"🎭", "anime":"🍥", "cartoon":"🎨"}.get(item.get("media_type"), "🎬")
         rows.append([InlineKeyboardButton(text=f"{icon} {item.get('name','Nomsiz')} · {code}", callback_data=f"show:{code}")])
     rows.append([InlineKeyboardButton(text="🔎 Yana qidirish", callback_data="search_name")])
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
@@ -1176,7 +1196,7 @@ async def send_episode(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("category_list:"))
 async def category_list_callback(call: CallbackQuery):
     media_type = call.data.split(":", 1)[1]
-    labels = {"movie":("🎞 Kinolar", "📭 Kino hali qo'shilmagan"), "series":("📺 Seriallar", "📭 Serial hali qo'shilmagan"), "drama":("🎭 Dramalar", "📭 Drama hali qo'shilmagan")}
+    labels = {"movie":("🎞 Kinolar", "📭 Kino hali qo'shilmagan"), "series":("📺 Seriallar", "📭 Serial hali qo'shilmagan"), "drama":("🎭 Dramalar", "📭 Drama hali qo'shilmagan"), "anime":("🍥 Anime", "📭 Anime hali qo'shilmagan"), "cartoon":("🎨 Multfilmlar", "📭 Multfilm hali qo'shilmagan")}
     title, empty = labels.get(media_type, ("🎬 Kontent", "📭 Hozircha bo'sh"))
     await media_category_list(call, media_type, title, empty)
 
@@ -1335,6 +1355,7 @@ async def add_series(call: CallbackQuery, state: FSMContext):
         return await call.answer("⛔ Sizda kontent qo'shish huquqi yo'q.", show_alert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📺 Serial", callback_data="newtype:series"), InlineKeyboardButton(text="🎭 Drama", callback_data="newtype:drama")],
+        [InlineKeyboardButton(text="🍥 Anime", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm", callback_data="newtype:cartoon")],
     ])
     await call.message.answer("Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
     await call.answer()
@@ -1363,7 +1384,7 @@ async def media_code(message: Message, state: FSMContext):
     await state.update_data(new_code=code)
     await state.set_state(Form.media_name)
     saved = await state.get_data()
-    await message.answer({"movie":"🎞 Kino nomini", "series":"📺 Serial nomini", "drama":"🎭 Drama nomini"}.get(saved.get("media_type"), "🎬 Kontent nomini") + " yuboring:")
+    await message.answer({"movie":"🎞 Kino nomini", "series":"📺 Serial nomini", "drama":"🎭 Drama nomini", "anime":"🍥 Anime nomini", "cartoon":"🎨 Multfilm nomini"}.get(saved.get("media_type"), "🎬 Kontent nomini") + " yuboring:")
 
 
 @dp.message(Form.media_name)
@@ -2201,75 +2222,6 @@ async def main_reply_keyboard_routes(message: Message, state: FSMContext):
         await message.answer("⭐ <b>Yoqtirganlarim</b>" if len(rows) > 1 else "⭐ Hozircha saqlangan narsa yo‘q.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
-@dp.message(Command("maintenance_on"))
-async def maintenance_on(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return
-    data = load_data()
-    data.setdefault("settings", {})["maintenance"] = True
-    save_data(data)
-    await send_backup(bot, "Yangilanish oldidan zaxira")
-    await message.answer("🛠 Yangilanish rejimi yoqildi. Foydalanuvchilarga ogohlantirish ko‘rsatiladi.\nO‘chirish uchun /maintenance_off")
-
-
-@dp.message(Command("maintenance_off"))
-async def maintenance_off(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return
-    data = load_data()
-    data.setdefault("settings", {})["maintenance"] = False
-    save_data(data)
-    await message.answer("✅ Yangilanish rejimi o‘chirildi. Bot odatdagidek ishlaydi.")
-
-
-@dp.message(Command("maintenance_status"))
-async def maintenance_status(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return
-    enabled = bool(load_data().get("settings", {}).get("maintenance", False))
-    await message.answer("Holat: " + ("🛠 Yangilanish rejimi yoqilgan" if enabled else "✅ Oddiy ish rejimi"))
-
-
-@dp.message(Command("backup"))
-async def backup_now(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return
-    if not BACKUP_CHANNEL_ID:
-        await message.answer("BACKUP_CHANNEL_ID Render Environment bo‘limiga kiritilmagan.")
-        return
-    ok = await send_backup(bot, "Egasi so‘rovi bilan zaxira")
-    await message.answer("✅ Zaxira kanalga yuborildi." if ok else "❌ Zaxira yuborilmadi. BACKUP_CHANNEL_ID va botning kanal adminligini tekshiring.")
-
-
-@dp.message(F.document)
-async def restore_backup_document(message: Message):
-    if not message.from_user or message.from_user.id != OWNER_ID:
-        return
-    doc = message.document
-    if not doc or not (doc.file_name or "").lower().endswith(".json"):
-        return
-    try:
-        file = await bot.get_file(doc.file_id)
-        downloaded = await bot.download_file(file.file_path)
-        raw = downloaded.read()
-        candidate = json.loads(raw.decode("utf-8"))
-        if not isinstance(candidate, dict) or not isinstance(candidate.get("medias", {}), dict):
-            raise ValueError("JSON tuzilmasi noto‘g‘ri")
-        await send_backup(bot, "Tiklashdan oldingi zaxira")
-        temp_path = DATA_FILE.with_suffix(DATA_FILE.suffix + ".restore.tmp")
-        temp_path.write_text(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        json.loads(temp_path.read_text(encoding="utf-8"))
-        temp_path.replace(DATA_FILE)
-        global _DATA_CACHE, _DATA_CACHE_MTIME
-        _DATA_CACHE = None
-        _DATA_CACHE_MTIME = None
-        await message.answer(f"✅ Zaxira tiklandi. Medialar soni: {len(candidate.get('medias', {}))}. Botni qayta ishga tushirish tavsiya etiladi.")
-    except Exception as exc:
-        logging.exception("Zaxira tiklanmadi")
-        await message.answer(f"❌ Zaxira tiklanmadi. Asl ma’lumotlarga tegilmadi. Sabab: {type(exc).__name__}")
-
-
-
 @dp.message()
 async def fallback(message: Message):
     if message.text and message.text.isdigit():
@@ -2342,15 +2294,11 @@ async def main():
             data["admins"].append(admin_id)
     save_data(data)
     runner = await start_web_server()
-    backup_task = asyncio.create_task(backup_watcher())
     try:
+        await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash")])
+        await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash"), BotCommand(command="backup", description="Zaxira olish")], scope=__import__("aiogram.types", fromlist=["BotCommandScopeChat"]).BotCommandScopeChat(chat_id=OWNER_ID))
         await dp.start_polling(bot)
     finally:
-        backup_task.cancel()
-        try:
-            await backup_task
-        except asyncio.CancelledError:
-            pass
         await runner.cleanup()
         await bot.session.close()
 
