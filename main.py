@@ -118,7 +118,15 @@ def small_caps_html(value):
         elif in_code:
             output.append(token)
         else:
-            output.append(small_caps(token))
+            # Slash commands (/start, /done) va @username oddiy shrift bo'lib qoladi.
+            pieces = re.split(r"(@[A-Za-z0-9_]{3,}|/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?)", token)
+            for piece in pieces:
+                if not piece:
+                    continue
+                if re.fullmatch(r"(?:@[A-Za-z0-9_]{3,}|/[A-Za-z0-9_]+(?:@[A-Za-z0-9_]+)?)", piece):
+                    output.append(piece)
+                else:
+                    output.append(small_caps(piece))
     return "".join(output)
 
 class StyledBot(Bot):
@@ -464,13 +472,14 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
                 # Eski bitta-bazali format faqat ikki baza sozlanmagan holatda ishlaydi.
                 available_numbers.append(number)
         sorted_numbers = sorted(available_numbers, key=sort_key)
-        # Har sahifada 25 ta qism; qolganlari keyingi sahifaga o'tadi.
-        total_pages = max(1, (len(sorted_numbers) + 24) // 25)
+        # Har sahifada 15 ta qism; keyingi sahifalar uchun oldinga/orqaga tugmalari.
+        page_size = 15
+        total_pages = max(1, (len(sorted_numbers) + page_size - 1) // page_size)
         page = max(0, min(int(page), total_pages - 1))
-        page_numbers = sorted_numbers[page * 25:(page + 1) * 25]
-        # 1-qism tugmasi birinchi bo'lib chiqadi.
+        page_numbers = sorted_numbers[page * page_size:(page + 1) * page_size]
+        # Kino va serial qismlari faqat raqam bilan ko'rsatiladi: 1, 2, 3...
         for number in page_numbers:
-            row.append(InlineKeyboardButton(text=("▶️ Tomosha qilish" if media.get("media_type") == "movie" else ("▶️ 1-qism" if str(number) == "1" else str(number))), callback_data=f"episode:{code}:{season}:{number}"))
+            row.append(InlineKeyboardButton(text=str(number), callback_data=f"episode:{code}:{season}:{number}"))
             if len(row) == 5:
                 rows.append(row); row=[]
         if row: rows.append(row)
@@ -632,7 +641,9 @@ async def require_subscription_message(message: Message) -> bool:
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
-    asyncio.create_task(notify_new_user(message.from_user))
+    # Avval ro'yxatdan o'tkazish va yangi obunachi xabarini yuborishni kutamiz;
+    # create_task bilan parallel ishlatish yangi userni oldindan saqlab, xabarni o'tkazib yuborardi.
+    await notify_new_user(message.from_user)
     data = load_data()
     ensure_user(data, message.from_user)
     save_data(data)
