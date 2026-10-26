@@ -84,6 +84,10 @@ BACKUP_CHANNEL_ID = os.getenv("BACKUP_CHANNEL_ID", "").strip()
 ADMIN_CONTACT = "@AnimBot_Admin"
 # media postlari saqlanadigan kanal ID sini STORAGE_CHANNEL_ID environment variable orqali berish mumkin.
 CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "").strip()
+
+def get_backup_channel_id():
+    """Owner panelidagi kanal sozlamasi ENV qiymatidan ustun turadi."""
+    return str(load_data().get("settings", {}).get("backup_channel_id") or BACKUP_CHANNEL_ID or "").strip()
 # =================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -377,6 +381,7 @@ def admin_menu(user_id=None):
         rows.append([InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="rename_code")])
     if "delete_content" in perms:
         rows.append([InlineKeyboardButton(text="🗑 Kontent o'chirish", callback_data="del_media")])
+        rows.append([InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode"), InlineKeyboardButton(text="🗑 Fasl o'chirish", callback_data="del_season")])
     return InlineKeyboardMarkup(inline_keyboard=rows or [[InlineKeyboardButton(text="⛔ Sizga huquq berilmagan", callback_data="admin_home")]])
 
 
@@ -385,12 +390,14 @@ def owner_menu():
         [InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="add_movie"), InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="add_series")],
         [InlineKeyboardButton(text="🍥 Anime qo'shish", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm qo'shish", callback_data="newtype:cartoon")],
         [InlineKeyboardButton(text="➕ Qism yoki yangi sezon", callback_data="add_episode"), InlineKeyboardButton(text="🗑 Kontent o'chirish", callback_data="del_media")],
+        [InlineKeyboardButton(text="🗑 Fasl o'chirish", callback_data="del_season")],
         [InlineKeyboardButton(text="✏️ Nom / kodni tahrirlash", callback_data="rename_media"), InlineKeyboardButton(text="🖼 Posterni tahrirlash", callback_data="edit_poster")],
         [InlineKeyboardButton(text="👤 Admin qo'shish", callback_data="add_admin"), InlineKeyboardButton(text="➖ Admin o'chirish", callback_data="del_admin")],
         [InlineKeyboardButton(text="🔐 Admin huquqlarini sozlash", callback_data="admin_permissions")],
         [InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="add_channel"), InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="del_channel")],
         [InlineKeyboardButton(text="🎨 Tugma ranglari", callback_data="appearance")],
         [InlineKeyboardButton(text="💾 Zaxira olish", callback_data="owner_backup"), InlineKeyboardButton(text="♻️ Zaxirani tiklash", callback_data="owner_restore_help")],
+        [InlineKeyboardButton(text="🗄 Zaxira kanalini o'zgartirish", callback_data="backup_channel_change")],
         [InlineKeyboardButton(text="🛠 Texnik tanaffus: holat", callback_data="owner_maintenance")],
         [InlineKeyboardButton(text=("💎 VIP: O'CHIRISH" if load_data().get("settings", {}).get("vip_enabled", False) else "💎 VIP: YOQISH"), callback_data="owner_vip")],
         [InlineKeyboardButton(text="📣 Hammaga xabar yuborish", callback_data="broadcast")],
@@ -417,7 +424,7 @@ def catalog_item_for_media(data: dict, media: dict):
     return None, None
 
 
-def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=None, user_id=None, season="1", media=None):
+def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=None, user_id=None, season="1", media=None, page=0):
     """Qismlar faqat 1, 2, 3 ko‘rinishida; ko‘p faslda avval fasl tanlanadi."""
     rows, row = [], []
     media = media or {}
@@ -454,12 +461,24 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
                 # Eski bitta-bazali format faqat ikki baza sozlanmagan holatda ishlaydi.
                 available_numbers.append(number)
         sorted_numbers = sorted(available_numbers, key=sort_key)
-        # 1-qism tugmasi birinchi bo'lib chiqadi, foydalanuvchi darhol boshlashi mumkin.
-        for number in sorted_numbers:
+        # Har sahifada 25 ta qism; qolganlari keyingi sahifaga o'tadi.
+        total_pages = max(1, (len(sorted_numbers) + 24) // 25)
+        page = max(0, min(int(page), total_pages - 1))
+        page_numbers = sorted_numbers[page * 25:(page + 1) * 25]
+        # 1-qism tugmasi birinchi bo'lib chiqadi.
+        for number in page_numbers:
             row.append(InlineKeyboardButton(text=("▶️ Tomosha qilish" if media.get("media_type") == "movie" else ("▶️ 1-qism" if str(number) == "1" else str(number))), callback_data=f"episode:{code}:{season}:{number}"))
             if len(row) == 5:
                 rows.append(row); row=[]
         if row: rows.append(row)
+        if total_pages > 1:
+            pager = []
+            if page > 0:
+                pager.append(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"season_page:{code}:{season}:{page-1}"))
+            pager.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="page_info"))
+            if page < total_pages - 1:
+                pager.append(InlineKeyboardButton(text="Oldinga ➡️", callback_data=f"season_page:{code}:{season}:{page+1}"))
+            rows.append(pager)
         if len(season_keys) > 1:
             rows.append([InlineKeyboardButton(text="⬅️ Fasllar", callback_data=f"season_show:{code}:choose")])
     rows.append([InlineKeyboardButton(text="♥️ Sevimlilarga qo‘shish", callback_data=f"favorite_add:{code}")])
@@ -521,6 +540,8 @@ class Form(StatesGroup):
     delete_code = State()
     delete_episode_code = State()
     delete_episode_number = State()
+    delete_season_code = State()
+    delete_season_number = State()
     rename_code = State()
     rename_name = State()
     recode_old = State()
@@ -532,6 +553,7 @@ class Form(StatesGroup):
     start_text = State()
     manage_user_id = State()
     owner_setting_value = State()
+    owner_backup_channel = State()
     broadcast_message = State()
     button_text_value = State()
     edit_poster_code = State()
@@ -632,7 +654,10 @@ async def owner_settings_callback(call: CallbackQuery):
         [InlineKeyboardButton(text=f"💬 To‘lov admini: @{str(cfg.get('admin_contact', 'obidov_xz')).lstrip('@')}", callback_data="setcfg:admin_contact")],
         [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
     ])
-    await call.message.answer("⚙️ <b>Bot sozlamalari</b>\nKerakli sozlamani tanlab qiymatini o‘zgartiring. Eski umumiy baza olib tashlangan.", reply_markup=kb)
+    try:
+        await call.message.edit_text("⚙️ <b>Bot sozlamalari</b>", reply_markup=kb)
+    except Exception:
+        await call.message.answer("⚙️ <b>Bot sozlamalari</b>", reply_markup=kb)
     await call.answer()
 
 
@@ -707,6 +732,49 @@ async def manage_users_callback(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@dp.callback_query(F.data == "backup_channel_change")
+async def backup_channel_change_callback(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    current = get_backup_channel_id() or "sozlanmagan"
+    await state.set_state(Form.owner_backup_channel)
+    await call.message.answer(
+        "🗄 <b>Zaxira kanalini sozlash</b>\n"
+        f"Hozirgi kanal ID: <code>{current}</code>\n\n"
+        "Yangi kanal ID sini yuboring (masalan, <code>-1001234567890</code>).\n"
+        "O‘chirish uchun <code>off</code> yuboring. Bot o‘sha kanalga admin bo‘lishi kerak.\n"
+        "Bekor qilish: /cancel"
+    )
+    await call.answer()
+
+
+@dp.message(Form.owner_backup_channel)
+async def backup_channel_change_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Faqat owner uchun.")
+    raw = (message.text or "").strip()
+    if raw == "/cancel":
+        await state.clear()
+        return await message.answer("Bekor qilindi.", reply_markup=owner_menu())
+    data = load_data()
+    if raw.casefold() in {"off", "o‘chirish", "ochirish"}:
+        data.setdefault("settings", {}).pop("backup_channel_id", None)
+        save_data(data)
+        await state.clear()
+        return await message.answer("✅ Zaxira kanal sozlamasi olib tashlandi. ENV dagi BACKUP_CHANNEL_ID ishlatiladi; u ham bo‘sh bo‘lsa, zaxira shaxsiy xabarga yuboriladi.", reply_markup=owner_menu())
+    try:
+        channel_id = int(raw)
+        if channel_id >= 0:
+            raise ValueError
+    except ValueError:
+        return await message.answer("❌ Kanal ID manfiy raqam bo‘lishi kerak, masalan -1001234567890. Qayta yuboring:")
+    data.setdefault("settings", {})["backup_channel_id"] = str(channel_id)
+    save_data(data)
+    await state.clear()
+    await message.answer(f"✅ Zaxira kanali saqlandi: <code>{channel_id}</code>\nBot kanalga admin qilinganini tekshiring.", reply_markup=owner_menu())
+
+
 @dp.callback_query(F.data == "owner_backup")
 async def owner_backup_callback(call: CallbackQuery):
     if not is_owner(call.from_user.id):
@@ -715,8 +783,9 @@ async def owner_backup_callback(call: CallbackQuery):
     payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     doc = BufferedInputFile(payload, filename=f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     try:
-        if BACKUP_CHANNEL_ID:
-            await bot.send_document(BACKUP_CHANNEL_ID, doc, caption="🤖 Bot avtomatik zaxirasi")
+        backup_channel_id = get_backup_channel_id()
+        if backup_channel_id:
+            await bot.send_document(backup_channel_id, doc, caption="🤖 Bot avtomatik zaxirasi")
             await call.message.answer("✅ Zaxira JSON fayli BACKUP_CHANNEL_ID kanaliga yuborildi.", reply_markup=owner_menu())
         else:
             await bot.send_document(call.from_user.id, doc, caption="💾 Bot zaxirasi. Xavfsiz joyda saqlang.")
@@ -961,8 +1030,9 @@ async def backup_command(message: Message):
         return await message.answer("⛔ Bu buyruq faqat owner uchun.")
     payload = json.dumps(load_data(), ensure_ascii=False, indent=2).encode("utf-8")
     doc = BufferedInputFile(payload, filename=f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-    if BACKUP_CHANNEL_ID:
-        await bot.send_document(BACKUP_CHANNEL_ID, doc, caption="🤖 Bot zaxirasi")
+    backup_channel_id = get_backup_channel_id()
+    if backup_channel_id:
+        await bot.send_document(backup_channel_id, doc, caption="🤖 Bot zaxirasi")
         await message.answer("✅ Zaxira kanalga yuborildi.")
     else:
         await message.answer_document(doc, caption="💾 Bot zaxirasi")
@@ -971,6 +1041,8 @@ async def backup_command(message: Message):
 async def admin_command(message: Message):
     if not is_admin(message.from_user.id):
         return await message.answer("⛔ Sizda admin huquqi yo'q.")
+    try: await message.delete()
+    except Exception: pass
     await message.answer("🎬 <b>Kino va serial boshqaruvi</b>", reply_markup=admin_menu(message.from_user.id))
 
 
@@ -978,6 +1050,8 @@ async def admin_command(message: Message):
 async def owner_command(message: Message):
     if not is_owner(message.from_user.id):
         return await message.answer("⛔ Bu buyruq faqat bot egasi uchun.")
+    try: await message.delete()
+    except Exception: pass
     await message.answer("⚙️ <b>Owner paneli</b>", reply_markup=owner_menu())
 
 
@@ -995,15 +1069,15 @@ async def home(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "search_menu")
 async def search_menu_open(call: CallbackQuery):
     try:
-        await call.message.edit_text("🔎 <b>Kino va video izlash</b>\n\nKod yoki nom orqali qidiring, ro‘yxatlardan foydalaning:", reply_markup=search_menu(call.from_user.id))
+        await call.message.edit_text("🔎 <b>Kino va video izlash</b>", reply_markup=search_menu(call.from_user.id))
     except Exception:
-        await call.message.answer("🔎 <b>Kino va video izlash</b>\n\nKod yoki nom orqali qidiring, ro‘yxatlardan foydalaning:", reply_markup=search_menu(call.from_user.id))
+        await call.message.answer("🔎 <b>Kino va video izlash</b>", reply_markup=search_menu(call.from_user.id))
     await call.answer()
 
 
 @dp.callback_query(F.data == "guide")
 async def guide(call: CallbackQuery):
-    text = "📖 <b>Qo'llanma</b>\n\n1️⃣ Kerakli bo'limni tanlang: kino yoki serial.\n2️⃣ Kod yoki nom orqali qidiring; nom yozib yuborilgach o'xshash natijalar tugma bo'lib chiqadi.\n3️⃣ Kontentni oching — mavjud bo'lsa 1-qismdan boshlang, pastdagi ⬅️/➡️ tugmalari bilan qismlar almashadi.\n\n🛑 Orqaga tugmasi oldingi menyuga qaytaradi."
+    text = "📖 <b>Qo'llanma</b>"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛑 Orqaga", callback_data="home")]])
     try:
         await call.message.edit_text(text, reply_markup=kb)
@@ -1217,6 +1291,24 @@ async def search_code(message: Message, state: FSMContext):
         return await message.answer("❌ Bu kod bo‘yicha kino yoki serial topilmadi.")
     await send_media_card(message.chat.id, code, media)
 
+
+@dp.callback_query(F.data == "page_info")
+async def page_info(call: CallbackQuery):
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("season_page:"))
+async def season_page(call: CallbackQuery):
+    try:
+        _, code, season_no, page = call.data.split(":")
+        data = load_data(); media = data["medias"][code]
+        seasons = media.get("seasons") or {"1": {"episodes": media.get("episodes", {})}}
+        episodes = seasons.get(season_no, {}).get("episodes", {})
+        markup = episode_keyboard(code, episodes, user_id=call.from_user.id, season=season_no, media=media, page=int(page))
+        await call.message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        await call.answer("Sahifani ochib bo‘lmadi.", show_alert=True)
+    else:
+        await call.answer()
 
 @dp.callback_query(F.data.startswith("season_show:"))
 async def season_show(call: CallbackQuery):
@@ -1691,8 +1783,7 @@ async def episode_code(message: Message, state: FSMContext):
     await state.set_state(Form.episode_season)
     await message.answer(
         f"🎬 <b>{item['name']}</b> tanlandi.\nMavjud fasllar: {', '.join(sorted(seasons, key=lambda x: int(x) if str(x).isdigit() else 999))}\n\n"
-        "Qaysi faslga qism qo‘shamiz? Fasl raqamini yuboring (masalan: 2).\n"
-        "Agar bu yangi fasl bo‘lsa ham raqamini yozing."
+        "Fasl raqamini yuboring (masalan: 2). Yangi fasl bo‘lsa ham raqamini yozing."
     )
 
 
@@ -1717,9 +1808,7 @@ async def episode_season_select(message: Message, state: FSMContext):
     await state.update_data(batch_season=season_no, batch_count=0)
     await state.set_state(Form.episode_batch)
     prompt = await message.answer(
-        f"🎬 <b>{item['name']}</b> · <b>{season_no}-fasl</b>\nQismlar olinadigan kanaldagi postlarni botga forward qiling.\n"
-        "Bot faqat bot administrator bo'lgan kanaldan forward qilingan postlarni qabul qiladi va 1-qism, 2-qism deb raqamlaydi.\n"
-        "Tugatish: /done · Bekor qilish: /cancel"
+        f"🎬 <b>{item['name']}</b> · <b>{season_no}-fasl</b>\nQismlarni bittadan yuboring. Birinchi media 1-qism, ikkinchisi 2-qism bo‘ladi.\n/done — tugatish · /cancel — bekor qilish"
     )
     await state.update_data(progress_message_id=prompt.message_id)
 
@@ -1740,21 +1829,21 @@ async def episode_batch_message(message: Message, state: FSMContext):
         await state.clear()
         return await message.answer("❎ Bekor qilindi.", reply_markup=admin_menu(message.from_user.id))
 
+    # Media istalgan manbadan qabul qilinadi: kanal, mavzu, guruh yoki shaxsiy chat.
+    # Faylni serverga yuklamaymiz; Telegram file_id yoki kerak bo'lsa source message saqlanadi.
+    media_type = None
+    file_id = None
+    for attr in ("video", "document", "audio", "animation", "photo", "voice"):
+        obj = getattr(message, attr, None)
+        if obj:
+            media_type = attr
+            file_id = (obj[-1].file_id if attr == "photo" else obj.file_id)
+            break
     origin = getattr(message, "forward_origin", None)
-    if not origin or getattr(origin, "type", "") not in ("channel", "chat"):
-        return await message.answer("❌ Qismni bot administrator bo'lgan kanal yoki superguruhdan to'g'ridan-to'g'ri forward qiling. Bir nechta mavzuli kanal/guruh ishlatishingiz mumkin.\nTugatish: /done · Bekor qilish: /cancel")
-    origin_chat = getattr(origin, "chat", None)
-    origin_message_id = getattr(origin, "message_id", None)
-    if not origin_chat or not origin_message_id:
-        return await message.answer("❌ Forward qilingan kanal xabarini aniqlab bo'lmadi. Kanal postini to'g'ridan-to'g'ri forward qiling.")
-    try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(origin_chat.id, me.id)
-        status = str(member.status).split(".")[-1].lower()
-        if status not in ("administrator", "creator"):
-            return await message.answer("❌ Bot bu kanalda administrator emas. Avval botni kanalga admin qiling.")
-    except Exception:
-        return await message.answer("❌ Kanalni tekshirib bo'lmadi. Bot shu kanalda administrator ekanini tekshiring.")
+    origin_chat = getattr(origin, "chat", None) if origin else None
+    origin_message_id = getattr(origin, "message_id", None) if origin else None
+    if not file_id and not (origin_chat and origin_message_id):
+        return await message.answer("❌ Video yoki media yuboring/forward qiling. Tugatish: /done")
 
     saved = await state.get_data()
     code = str(saved.get("batch_code", ""))
@@ -1768,7 +1857,10 @@ async def episode_batch_message(message: Message, state: FSMContext):
     episodes = season.setdefault("episodes", {})
     numeric = [int(n) for n in episodes if str(n).isdigit()]
     number = max(numeric, default=0) + 1
-    record = {"chat_id": origin_chat.id, "message_id": origin_message_id}
+    if file_id:
+        record = {"file_id": file_id, "media_type": media_type or "video", "caption": (message.caption or "")[:900]}
+    else:
+        record = {"chat_id": origin_chat.id, "message_id": origin_message_id}
     episodes[str(number)] = record
     if season_no == "1":
         item.setdefault("episodes", {})[str(number)] = record
@@ -1925,6 +2017,39 @@ async def delete_episode_save(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"🗑 {number}-qism o'chirildi.", reply_markup=admin_menu(message.from_user.id))
 
+
+@dp.callback_query(F.data == "del_season")
+async def del_season_start(call: CallbackQuery, state: FSMContext):
+    if not has_permission(call.from_user.id, "delete_content"):
+        return await call.answer("⛔ Sizda o‘chirish huquqi yo‘q.", show_alert=True)
+    await ask(call, state, Form.delete_season_code, "Faslini o‘chirmoqchi bo‘lgan kino/serial kodini yuboring:")
+
+@dp.message(Form.delete_season_code)
+async def del_season_code(message: Message, state: FSMContext):
+    if not has_permission(message.from_user.id, "delete_content"):
+        await state.clear(); return
+    code = (message.text or "").strip(); data = load_data()
+    if code not in data.get("medias", {}):
+        return await message.answer("Kod topilmadi. Qayta yuboring:")
+    await state.update_data(delete_season_code=code)
+    await state.set_state(Form.delete_season_number)
+    await message.answer("O‘chiriladigan fasl raqamini yuboring:")
+
+@dp.message(Form.delete_season_number)
+async def del_season_number(message: Message, state: FSMContext):
+    if not has_permission(message.from_user.id, "delete_content"):
+        await state.clear(); return
+    raw = (message.text or "").strip()
+    if not raw.isdigit(): return await message.answer("Fasl raqamini raqam bilan yuboring:")
+    saved = await state.get_data(); code = str(saved.get("delete_season_code", "")); sn = str(int(raw))
+    data = load_data(); media = data.get("medias", {}).get(code)
+    if not media or sn not in media.get("seasons", {}):
+        return await message.answer("Bunday fasl topilmadi. Qayta yuboring:")
+    count = len(media["seasons"][sn].get("episodes", {}))
+    del media["seasons"][sn]
+    if sn == "1": media["episodes"] = {}
+    save_data(data); await state.clear()
+    await message.answer(f"🗑 {sn}-fasl va undagi {count} ta qism o‘chirildi.", reply_markup=admin_menu(message.from_user.id))
 
 @dp.callback_query(F.data == "rename_media")
 async def rename_start(call: CallbackQuery, state: FSMContext):
