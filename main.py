@@ -376,6 +376,9 @@ def admin_menu(user_id=None):
     if "add_content" in perms:
         rows.append([InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="newtype:movie"), InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="newtype:series")])
         rows.append([InlineKeyboardButton(text="🍥 Anime qo'shish", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm qo'shish", callback_data="newtype:cartoon")])
+    # Admin panelida qism/fasl qo'shish tugmasi alohida ko'rsatiladi.
+    if "add_episode" in perms:
+        rows.append([InlineKeyboardButton(text="➕ Qism / yangi fasl qo'shish", callback_data="add_episode")])
     if "edit_content" in perms:
         rows.append([InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_media"), InlineKeyboardButton(text="🖼 Posterni o'zgartirish", callback_data="edit_poster")])
         rows.append([InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="rename_code")])
