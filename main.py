@@ -413,6 +413,7 @@ def owner_menu():
         [InlineKeyboardButton(text=("💎 VIP: O'CHIRISH" if load_data().get("settings", {}).get("vip_enabled", False) else "💎 VIP: YOQISH"), callback_data="owner_vip")],
         [InlineKeyboardButton(text="📣 Hammaga xabar yuborish", callback_data="broadcast")],
         [InlineKeyboardButton(text="⚙️ Bot sozlamalari", callback_data="owner_settings")],
+        [InlineKeyboardButton(text="👥 Obunachilarni boshqarish", callback_data="manage_users")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
         [InlineKeyboardButton(text=("📣 Yangi kontent xabari: YOQILGAN" if load_data().get("settings", {}).get("notify_new_content", True) else "📣 Yangi kontent xabari: O‘CHIRILGAN"), callback_data="owner_notify_toggle")],
     ])
@@ -571,6 +572,9 @@ class Form(StatesGroup):
     edit_poster_code = State()
     edit_poster_file = State()
     admin_permissions_id = State()
+    manage_vip_days = State()
+    manage_balance_amount = State()
+    manage_mute_duration = State()
 
 
 def parse_channel_entry(entry):
@@ -629,6 +633,11 @@ async def require_subscription_message(message: Message) -> bool:
     if int(message.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
         await message.answer("⛔ Siz botdan foydalanishdan chetlatilgansiz.")
         return False
+    user_record = data.get("users", {}).get(str(message.from_user.id), {})
+    mute_until = int(user_record.get("mute_until", 0) or 0)
+    if mute_until > now_ts():
+        await message.answer(f"🔇 Botdan foydalanish vaqtincha cheklangan.\nQayta foydalanish: {fmt_date(mute_until)}")
+        return False
     if await check_subscription(message.from_user.id):
         return True
     await message.answer(
@@ -649,6 +658,9 @@ async def start(message: Message, state: FSMContext):
     save_data(data)
     if int(message.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
         return await message.answer("⛔ Siz botdan foydalanishdan chetlatilgansiz.")
+    _u = data.get("users", {}).get(str(message.from_user.id), {})
+    if int(_u.get("mute_until", 0) or 0) > now_ts():
+        return await message.answer(f"🔇 Botdan foydalanish vaqtincha cheklangan.\nQayta foydalanish: {fmt_date(int(_u['mute_until']))}")
     if not await check_subscription(message.from_user.id):
         return await message.answer("🔒 <b>Botdan foydalanishdan oldin majburiy kanallarga obuna bo‘ling.</b>", reply_markup=subscription_keyboard())
     await send_start(message)
@@ -988,13 +1000,23 @@ async def show_user_management(message: Message, user_id: int):
     data = load_data()
     user = data.get("users", {}).get(str(user_id))
     if not user:
-        return await message.answer("❌ Bu foydalanuvchi bazada topilmadi. U botda /start bosgan bo'lishi kerak.")
+        return await message.answer("❌ Bu foydalanuvchi bazada topilmadi. U botda /start bosgan bo‘lishi kerak.")
     banned = user_id in [int(x) for x in data.get("banned_users", [])]
+    vip_until = int(user.get("vip_until", 0) or 0)
+    mute_until = int(user.get("mute_until", 0) or 0)
+    balance = float(user.get("balance", 0) or 0)
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 VIP berish / muddatini uzaytirish", callback_data=f"uservip:{user_id}"), InlineKeyboardButton(text="❌ VIPni olish", callback_data=f"uservipremove:{user_id}")],
+        [InlineKeyboardButton(text="💰 Balansga pul qo‘shish", callback_data=f"userbalance:{user_id}"), InlineKeyboardButton(text="💸 Balansdan ayirish", callback_data=f"userbalanceout:{user_id}")],
+        [InlineKeyboardButton(text="🔇 Mute qilish", callback_data=f"usermute:{user_id}"), InlineKeyboardButton(text="🔊 Mute bekor qilish", callback_data=f"usermuteoff:{user_id}")],
         [InlineKeyboardButton(text="🚫 Ban qilish" if not banned else "✅ Unban qilish", callback_data=f"userban:{user_id}")],
-        [InlineKeyboardButton(text="⬅️ Admin menyu", callback_data="admin_home")]
+        [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
     ])
-    await message.answer(f"👤 <b>Foydalanuvchi</b>\nID: <code>{user_id}</code>\nUsername: @{user.get('username') or 'yo‘q'}\nBan: {'Ha' if banned else 'Yo‘q'}", reply_markup=kb)
+    await message.answer(
+        f"👤 <b>Foydalanuvchi</b>\nID: <code>{user_id}</code>\nUsername: @{user.get('username') or 'yo‘q'}"
+        f"\nVIP: {'Faol (' + fmt_date(vip_until) + ')' if vip_until > now_ts() else 'Faol emas'}"
+        f"\nBalans: {balance:g} so‘m\nMute: {fmt_date(mute_until) if mute_until > now_ts() else 'Yo‘q'}"
+        f"\nBan: {'Ha' if banned else 'Yo‘q'}", reply_markup=kb)
 
 
 @dp.message(Form.manage_user_id)
@@ -1037,6 +1059,66 @@ async def user_ban_callback(call: CallbackQuery):
 
 
 
+
+@dp.callback_query(F.data.startswith("uservip:"))
+async def user_vip_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
+    uid=int(call.data.split(":",1)[1]); await state.update_data(manage_uid=uid); await state.set_state(Form.manage_vip_days)
+    await call.message.answer("VIP muddatini kunlarda yuboring (masalan, 30). 0 yuborsangiz cheksiz VIP beriladi:")
+    await call.answer()
+
+@dp.message(Form.manage_vip_days)
+async def user_vip_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    try: days=int((message.text or "").strip()); assert days >= 0
+    except Exception: return await message.answer("0 yoki musbat kun sonini yuboring:")
+    ctx=await state.get_data(); uid=int(ctx["manage_uid"]); data=load_data(); user=data.get("users",{}).get(str(uid))
+    if not user: await state.clear(); return await message.answer("Foydalanuvchi topilmadi.")
+    user["vip_until"] = 0 if days == 0 else now_ts()+days*86400
+    save_data(data); await state.clear(); await message.answer("✅ VIP yangilandi."); await show_user_management(message,uid)
+
+@dp.callback_query(F.data.startswith("uservipremove:"))
+async def user_vip_remove(call: CallbackQuery):
+    if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
+    uid=int(call.data.split(":",1)[1]); data=load_data(); user=data.get("users",{}).get(str(uid),{})
+    user["vip_until"]=0; save_data(data); await call.answer("VIP bekor qilindi",show_alert=True); await show_user_management(call.message,uid)
+
+@dp.callback_query(F.data.startswith(("userbalance:","userbalanceout:")))
+async def user_balance_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
+    mode,uid=call.data.split(":",1); await state.update_data(manage_uid=int(uid), balance_mode=mode); await state.set_state(Form.manage_balance_amount)
+    await call.message.answer("Summani so‘mda yuboring (faqat musbat son):"); await call.answer()
+
+@dp.message(Form.manage_balance_amount)
+async def user_balance_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    try: amount=float((message.text or "").strip().replace(",",".")); assert amount > 0
+    except Exception: return await message.answer("Musbat summa kiriting:")
+    ctx=await state.get_data(); uid=int(ctx["manage_uid"]); data=load_data(); user=data.get("users",{}).get(str(uid))
+    if not user: await state.clear(); return await message.answer("Foydalanuvchi topilmadi.")
+    old=float(user.get("balance",0) or 0); user["balance"] = old + amount if ctx["balance_mode"]=="userbalance" else max(0,old-amount)
+    save_data(data); await state.clear(); await message.answer("✅ Balans yangilandi."); await show_user_management(message,uid)
+
+@dp.callback_query(F.data.startswith("usermute:"))
+async def user_mute_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
+    uid=int(call.data.split(":",1)[1]); await state.update_data(manage_uid=uid); await state.set_state(Form.manage_mute_duration)
+    await call.message.answer("Mute muddatini daqiqalarda yuboring (masalan, 60 = 1 soat, 1440 = 1 kun):"); await call.answer()
+
+@dp.message(Form.manage_mute_duration)
+async def user_mute_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    try: minutes=int((message.text or "").strip()); assert minutes > 0
+    except Exception: return await message.answer("Musbat daqiqa sonini yuboring:")
+    ctx=await state.get_data(); uid=int(ctx["manage_uid"]); data=load_data(); user=data.get("users",{}).get(str(uid))
+    if not user: await state.clear(); return await message.answer("Foydalanuvchi topilmadi.")
+    user["mute_until"] = now_ts()+minutes*60; save_data(data); await state.clear(); await message.answer("✅ Mute muddati saqlandi."); await show_user_management(message,uid)
+
+@dp.callback_query(F.data.startswith("usermuteoff:"))
+async def user_mute_off(call: CallbackQuery):
+    if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
+    uid=int(call.data.split(":",1)[1]); data=load_data(); data.get("users",{}).setdefault(str(uid),{})["mute_until"]=0
+    save_data(data); await call.answer("Mute bekor qilindi",show_alert=True); await show_user_management(call.message,uid)
 
 @dp.message(Command("backup"))
 async def backup_command(message: Message):
