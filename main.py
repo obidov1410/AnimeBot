@@ -957,21 +957,63 @@ async def vip_info_callback(call: CallbackQuery):
 
 @dp.callback_query(F.data == "vip_buy")
 async def vip_buy_callback(call: CallbackQuery):
-    cfg = load_data().get("settings", {})
+    data = load_data(); cfg = data.get("settings", {})
     if not cfg.get("vip_enabled", False) and not is_owner(call.from_user.id):
         return await call.answer("VIP hozircha o'chirilgan.", show_alert=True)
-    contact = str(cfg.get("admin_contact", "obidov_xz")).lstrip("@")
-    text = "💎 <b>VIP olish</b>\n\nVIP obunasini faollashtirish uchun admin bilan bog'laning."
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", url=f"https://t.me/{contact}")],
-        [InlineKeyboardButton(text="❓ VIP o'zi nima?", callback_data="vip_info")],
-        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
-    ])
-    try:
-        await call.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await call.message.answer(text, reply_markup=kb)
+    price = int(cfg.get("vip_month_price", 15000) or 15000)
+    max_months = max(1, min(24, int(cfg.get("vip_max_months", 6) or 6)))
+    rows = [[InlineKeyboardButton(text=f"{m} oy — {price*m:,} so'm".replace(',', ' '), callback_data=f"vip_plan:{m}")] for m in range(1, max_months+1)]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="vip_info")])
+    text = f"💎 <b>VIP sotib olish</b>\n\n1 oy: {price:,} so'm\nKerakli muddatni tanlang. Xarid ikki marta tasdiqlanadi va pul balansingizdan yechiladi.".replace(',', ' ')
+    try: await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except Exception: await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
+
+@dp.callback_query(F.data.startswith("vip_plan:"))
+async def vip_plan_callback(call: CallbackQuery):
+    data=load_data(); cfg=data.get("settings", {})
+    if not cfg.get("vip_enabled", False) and not is_owner(call.from_user.id):
+        return await call.answer("VIP hozircha o'chirilgan.", show_alert=True)
+    try: months=int(call.data.split(':',1)[1])
+    except ValueError: return await call.answer("Muddat noto'g'ri", show_alert=True)
+    max_months=max(1,min(24,int(cfg.get('vip_max_months',6) or 6)))
+    if not 1 <= months <= max_months: return await call.answer("Bu muddat mavjud emas", show_alert=True)
+    price=int(cfg.get('vip_month_price',15000) or 15000)*months
+    user=data.setdefault('users',{}).setdefault(str(call.from_user.id),{})
+    balance=float(user.get('balance',0) or 0)
+    if balance < price:
+        return await call.answer(f"Balansingiz yetarli emas. Kerak: {price:,} so'm; balans: {balance:g} so'm".replace(',', ' '), show_alert=True)
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Ha, sotib olaman", callback_data=f"vip_confirm:{months}")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="vip_buy")]
+    ])
+    text=f"⚠️ <b>Xaridni tasdiqlash</b>\n\nVIP muddati: {months} oy\nNarxi: {price:,} so'm\nBalansingiz: {balance:g} so'm\nXaridni davom ettirish uchun yana bir marta tasdiqlang.".replace(',', ' ')
+    try: await call.message.edit_text(text,reply_markup=kb)
+    except Exception: await call.message.answer(text,reply_markup=kb)
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("vip_confirm:"))
+async def vip_confirm_callback(call: CallbackQuery):
+    try: months=int(call.data.split(':',1)[1])
+    except ValueError: return await call.answer("Muddat noto'g'ri",show_alert=True)
+    data=load_data(); cfg=data.get('settings',{})
+    if not cfg.get('vip_enabled',False) and not is_owner(call.from_user.id): return await call.answer("VIP hozircha o'chirilgan.",show_alert=True)
+    max_months=max(1,min(24,int(cfg.get('vip_max_months',6) or 6)))
+    if not 1 <= months <= max_months: return await call.answer("Muddat noto'g'ri",show_alert=True)
+    user=data.setdefault('users',{}).setdefault(str(call.from_user.id),{})
+    price=int(cfg.get('vip_month_price',15000) or 15000)*months
+    balance=float(user.get('balance',0) or 0)
+    if balance < price: return await call.answer("Balansingiz yetarli emas.",show_alert=True)
+    # Takroriy callbackdan ikki marta pul yechilmasligi uchun balans tekshiruvi va yozish bir amalda.
+    user['balance']=balance-price
+    base=max(now_ts(),int(user.get('vip_until',0) or 0))
+    user['vip_until']=base+months*int(cfg.get('vip_duration_days',30) or 30)*86400
+    user.pop('vip_warned_until',None)
+    save_data(data)
+    text=f"✅ <b>VIP faollashtirildi!</b>\nMuddat: {months} oy\nTo'landi: {price:,} so'm\nQolgan balans: {user['balance']:g} so'm\nTugash vaqti: {fmt_date(user['vip_until'])}".replace(',', ' ')
+    try: await call.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Asosiy menyu",callback_data="home")]]))
+    except Exception: await call.message.answer(text)
+    await call.answer("VIP sotib olindi")
 
 
 @dp.callback_query(F.data == "admin_home")
@@ -2698,6 +2740,33 @@ async def start_web_server():
 
 
 
+async def vip_expiry_monitor():
+    """VIP muddati tugashini avtomatik to'xtatadi va 24 soat oldin bir marta ogohlantiradi."""
+    while True:
+        try:
+            data=load_data(); users=data.setdefault("users",{}); changed=False; now=now_ts()
+            for uid, user in users.items():
+                until=int(user.get("vip_until",0) or 0)
+                if until <= 0:
+                    continue
+                if until <= now:
+                    user["vip_until"]=0
+                    user.pop("vip_warned_until",None)
+                    changed=True
+                    try: await bot.send_message(int(uid), "⏰ VIP obunangiz muddati tugadi. VIP imkoniyatlari avtomatik o'chirildi.")
+                    except Exception: pass
+                elif until-now <= 86400 and int(user.get("vip_warned_until",0) or 0) != until:
+                    try:
+                        await bot.send_message(int(uid), f"⚠️ VIP obunangiz {fmt_date(until)} da tugaydi — 1 kundan kam vaqt qoldi. Balansingizni to'ldirib, VIPni uzaytirishingiz mumkin.")
+                        user["vip_warned_until"]=until; changed=True
+                    except Exception:
+                        # Xabar yuborilmasa keyingi aylanishda qayta urinadi.
+                        pass
+            if changed: save_data(data)
+        except Exception:
+            logging.exception("VIP expiry monitor error")
+        await asyncio.sleep(60)
+
 async def main():
     if not OWNER_ID:
         raise RuntimeError(
@@ -2716,6 +2785,7 @@ async def main():
             data["admins"].append(admin_id)
     save_data(data)
     runner = await start_web_server()
+    vip_monitor_task = asyncio.create_task(vip_expiry_monitor())
     try:
         from aiogram.types import BotCommandScopeChat
         await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash")])
@@ -2726,6 +2796,9 @@ async def main():
                 await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash"), BotCommand(command="admin", description="Admin paneli")], scope=BotCommandScopeChat(chat_id=admin_id))
         await dp.start_polling(bot)
     finally:
+        vip_monitor_task.cancel()
+        try: await vip_monitor_task
+        except asyncio.CancelledError: pass
         await runner.cleanup()
         await bot.session.close()
 
