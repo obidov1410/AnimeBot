@@ -366,10 +366,13 @@ def main_reply_keyboard():
 
 
 def search_menu(user_id=None):
+    # Kataloglar alohida ro'yxatlarni ochadi; kod va nom bo'yicha qidiruv alohida qoladi.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎞 Kino", callback_data="category:movie"), InlineKeyboardButton(text="📺 Serial", callback_data="category:series")],
-        [InlineKeyboardButton(text="🍥 Anime", callback_data="category:anime"), InlineKeyboardButton(text="🎨 Multfilm", callback_data="category:cartoon")],
-        [InlineKeyboardButton(text="🔢 Kod bo'yicha qidirish", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo'yicha qidirish", callback_data="search_name")],
+        [InlineKeyboardButton(text="🎞 Kinolar ro'yxati", callback_data="category_list:movie")],
+        [InlineKeyboardButton(text="🍥 Anime ro'yxati", callback_data="category_list:anime")],
+        [InlineKeyboardButton(text="🎨 Multiklar ro'yxati", callback_data="category_list:cartoon")],
+        [InlineKeyboardButton(text="📺 Seriallar ro'yxati", callback_data="category_list:series")],
+        [InlineKeyboardButton(text="🔢 Kod bo'yicha izlash", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo'yicha izlash", callback_data="search_name")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
     ])
 
@@ -487,10 +490,10 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
         if total_pages > 1:
             pager = []
             if page > 0:
-                pager.append(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"season_page:{code}:{season}:{page-1}"))
+                pager.append(InlineKeyboardButton(text="⬅️", callback_data=f"season_page:{code}:{season}:{page-1}"))
             pager.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="page_info"))
             if page < total_pages - 1:
-                pager.append(InlineKeyboardButton(text="Oldinga ➡️", callback_data=f"season_page:{code}:{season}:{page+1}"))
+                pager.append(InlineKeyboardButton(text="➡️", callback_data=f"season_page:{code}:{season}:{page+1}"))
             rows.append(pager)
         if len(season_keys) > 1:
             rows.append([InlineKeyboardButton(text="⬅️ Fasllar", callback_data=f"season_show:{code}:choose")])
@@ -1572,16 +1575,50 @@ async def series_list(call: CallbackQuery):
     await media_category_list(call, "series", "📺 Seriallar ro‘yxati", "📭 Hozircha serial qo‘shilmagan.")
 
 
-async def media_category_list(call: CallbackQuery, media_type: str, title: str, empty_text: str):
+async def media_category_list(call: CallbackQuery, media_type: str, title: str, empty_text: str, page: int = 0):
     data = load_data()
     if not await check_subscription(call.from_user.id):
         await call.message.answer("🔒 Avval majburiy kanallarga obuna bo‘ling.", reply_markup=subscription_keyboard())
         return await call.answer()
-    items = [(code, item) for code, item in data.get("medias", {}).items() if item.get("media_type", "series") == media_type and media_available_for_user(call.from_user.id, item, data)]
-    rows = [[InlineKeyboardButton(text=f"🎬 {item['name']} · {code}", callback_data=f"show:{code}")] for code, item in items[:80]]
+    items = [(str(code), item) for code, item in data.get("medias", {}).items()
+             if item.get("media_type", "series") == media_type
+             and media_available_for_user(call.from_user.id, item, data)]
+    items.sort(key=lambda pair: pair[1].get("name", "").casefold())
+    page_size = 10
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
+    page = max(0, min(int(page), total_pages - 1))
+    visible = items[page * page_size:(page + 1) * page_size]
+    rows = [[InlineKeyboardButton(text=f"🎬 {item.get('name', 'Nomsiz')} · {code}", callback_data=f"show:{code}")]
+            for code, item in visible]
+    if total_pages > 1:
+        pager = []
+        if page > 0:
+            pager.append(InlineKeyboardButton(text="⬅️", callback_data=f"media_page:{media_type}:{page-1}"))
+        pager.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="page_info"))
+        if page < total_pages - 1:
+            pager.append(InlineKeyboardButton(text="➡️", callback_data=f"media_page:{media_type}:{page+1}"))
+        rows.append(pager)
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
-    await call.message.answer(f"<b>{title}</b>" if items else empty_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    text = f"<b>{title}</b>\n\nJami: {len(items)} ta" if items else empty_text
+    try:
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except Exception:
+        await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
+
+
+@dp.callback_query(F.data.startswith("media_page:"))
+async def media_page_callback(call: CallbackQuery):
+    try:
+        _, media_type, page = call.data.split(":")
+    except ValueError:
+        return await call.answer()
+    labels = {"movie":("🎞 Kinolar ro'yxati", "📭 Hozircha kino qo'shilmagan."),
+              "anime":("🍥 Anime ro'yxati", "📭 Hozircha anime qo'shilmagan."),
+              "cartoon":("🎨 Multiklar ro'yxati", "📭 Hozircha multik qo'shilmagan."),
+              "series":("📺 Seriallar ro'yxati", "📭 Hozircha serial qo'shilmagan.")}
+    title, empty = labels.get(media_type, ("🎬 Kontent ro'yxati", "📭 Hozircha bo'sh."))
+    await media_category_list(call, media_type, title, empty, int(page))
 
 
 @dp.callback_query(F.data.startswith("favorite_add:"))
