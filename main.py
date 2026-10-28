@@ -50,6 +50,12 @@ def InlineKeyboardButton(*, text, **kwargs):
 
 def _button_color_group(callback_data, text=""):
     cb = str(callback_data or "")
+    # Katalog sahifalash tugmalari alohida sozlanadi; episode raqamlari bundan mustasno.
+    if cb == "page_info":
+        return "page_indicator"
+    if cb.startswith(("season_page:", "media_page:")):
+        if "⬅" in str(text): return "page_left"
+        if "➡" in str(text): return "page_right"
     if cb in ("home", "admin_home") or "Orqaga" in text or "Asosiy menyu" in text:
         return "back"
     if cb.startswith(("episode:", "show:", "season_show:", "catalog_show:")) or cb in ("list", "movie_list", "continue_watching"):
@@ -435,6 +441,18 @@ def catalog_item_for_media(data: dict, media: dict):
     return None, None
 
 
+def build_pager_row(left_button, middle_button, right_button):
+    """Sahifalash qatorini admin sozlamasiga ko‘ra tuzadi; None tugmalar chiqarilmaydi."""
+    pos = load_data().get("settings", {}).get("pager_position", "arrows_outside")
+    if pos == "arrows_inside":
+        buttons = [b for b in (right_button, middle_button, left_button) if b is not None]
+    else:
+        buttons = [b for b in (left_button, middle_button, right_button) if b is not None]
+    if pos == "arrows_row":
+        return [[b] for b in buttons]
+    return [buttons]
+
+
 def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=None, user_id=None, season="1", media=None, page=0):
     """Qismlar faqat 1, 2, 3 ko‘rinishida; ko‘p faslda avval fasl tanlanadi."""
     rows, row = [], []
@@ -484,13 +502,10 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
                 rows.append(row); row=[]
         if row: rows.append(row)
         if total_pages > 1:
-            pager = []
-            if page > 0:
-                pager.append(InlineKeyboardButton(text="⬅️", callback_data=f"season_page:{code}:{season}:{page-1}"))
-            pager.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="page_info"))
-            if page < total_pages - 1:
-                pager.append(InlineKeyboardButton(text="➡️", callback_data=f"season_page:{code}:{season}:{page+1}"))
-            rows.append(pager)
+            left_btn = InlineKeyboardButton(text="⬅️", callback_data=f"season_page:{code}:{season}:{page-1}") if page > 0 else None
+            middle_btn = InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="page_info")
+            right_btn = InlineKeyboardButton(text="➡️", callback_data=f"season_page:{code}:{season}:{page+1}") if page < total_pages - 1 else None
+            rows.extend(build_pager_row(left_btn, middle_btn, right_btn))
         if len(season_keys) > 1:
             rows.append([InlineKeyboardButton(text="⬅️ Fasllar", callback_data=f"season_show:{code}:choose")])
     rows.append([InlineKeyboardButton(text="♥️ Sevimlilarga qo‘shish", callback_data=f"favorite_add:{code}")])
@@ -1587,13 +1602,10 @@ async def media_category_list(call: CallbackQuery, media_type: str, title: str, 
     rows = [[InlineKeyboardButton(text=f"🎬 {item.get('name', 'Nomsiz')} · {code}", callback_data=f"show:{code}")]
             for code, item in visible]
     if total_pages > 1:
-        pager = []
-        if page > 0:
-            pager.append(InlineKeyboardButton(text="⬅️", callback_data=f"media_page:{media_type}:{page-1}"))
-        pager.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="page_info"))
-        if page < total_pages - 1:
-            pager.append(InlineKeyboardButton(text="➡️", callback_data=f"media_page:{media_type}:{page+1}"))
-        rows.append(pager)
+        left_btn = InlineKeyboardButton(text="⬅️", callback_data=f"media_page:{media_type}:{page-1}") if page > 0 else None
+        middle_btn = InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="page_info")
+        right_btn = InlineKeyboardButton(text="➡️", callback_data=f"media_page:{media_type}:{page+1}") if page < total_pages - 1 else None
+        rows.extend(build_pager_row(left_btn, middle_btn, right_btn))
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
     text = f"<b>{title}</b>\n\nJami: {len(items)} ta" if items else empty_text
     try:
@@ -2498,8 +2510,12 @@ async def appearance_menu(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🔎 Qidirish tugmalari: {colors.get('search', 'standart')}", callback_data="color_group:search")],
         [InlineKeyboardButton(text=f"🎬 Kontent tugmalari: {colors.get('content', 'standart')}", callback_data="color_group:content")],
+        [InlineKeyboardButton(text=f"⬅️ Katalog chap strelkasi: {colors.get('page_left', 'standart')}", callback_data="color_group:page_left")],
+        [InlineKeyboardButton(text=f"➡️ Katalog o‘ng strelkasi: {colors.get('page_right', 'standart')}", callback_data="color_group:page_right")],
+        [InlineKeyboardButton(text=f"🔢 1/3 sahifa ko‘rsatkichi: {colors.get('page_indicator', 'standart')}", callback_data="color_group:page_indicator")],
         [InlineKeyboardButton(text=f"⬅️ Orqaga tugmalari: {colors.get('back', 'standart')}", callback_data="color_group:back")],
         [InlineKeyboardButton(text=f"🧩 Boshqa tugmalar: {colors.get('other', 'standart')}", callback_data="color_group:other")],
+        [InlineKeyboardButton(text="↔️ Sahifalash tugmalari joylashuvi", callback_data="pager_position_menu")],
         [InlineKeyboardButton(text="🌈 Barcha tugmalar", callback_data="color_group:all")],
         [InlineKeyboardButton(text="♻️ Ranglarni tozalash", callback_data="color_reset")],
         [InlineKeyboardButton(text="✏️ Tugma nomlarini o‘zgartirish", callback_data="button_text_menu")],
@@ -2514,7 +2530,7 @@ async def color_group_select(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return await call.answer("Faqat admin va owner uchun", show_alert=True)
     group = call.data.split(":", 1)[1]
-    if group not in {"search", "content", "back", "other", "all"}:
+    if group not in {"search", "content", "back", "other", "all", "page_left", "page_right", "page_indicator"}:
         return await call.answer("Noto‘g‘ri guruh", show_alert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🟥 Qizil", callback_data=f"color_set:{group}:danger")],
@@ -2532,7 +2548,7 @@ async def color_set_save(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return await call.answer("Faqat admin va owner uchun", show_alert=True)
     _, group, color = call.data.split(":", 2)
-    if group not in {"search", "content", "back", "other", "all"} or color not in {"danger", "success", "primary", "default"}:
+    if group not in {"search", "content", "back", "other", "all", "page_left", "page_right", "page_indicator"} or color not in {"danger", "success", "primary", "default"}:
         return await call.answer("Noto‘g‘ri rang", show_alert=True)
     data = load_data()
     colors = data.setdefault("settings", {}).setdefault("button_colors", {})
@@ -2542,6 +2558,34 @@ async def color_set_save(call: CallbackQuery):
     await appearance_menu(call)
     await call.answer("Rang saqlandi")
 
+
+@dp.callback_query(F.data == "pager_position_menu")
+async def pager_position_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+    settings = load_data().get("settings", {})
+    pos = settings.get("pager_position", "arrows_outside")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("✅ ⬅️ 1/3 ➡️" if pos == "arrows_outside" else "⬅️ 1/3 ➡️"), callback_data="pager_position:arrows_outside")],
+        [InlineKeyboardButton(text=("✅ ➡️ 1/3 ⬅️" if pos == "arrows_inside" else "➡️ 1/3 ⬅️"), callback_data="pager_position:arrows_inside")],
+        [InlineKeyboardButton(text=("✅ Strelkalarni alohida qatorga" if pos == "arrows_row" else "Strelkalarni alohida qatorga"), callback_data="pager_position:arrows_row")],
+        [InlineKeyboardButton(text="⬅️ Ranglar menyusi", callback_data="appearance")],
+    ])
+    await call.message.answer("Sahifalash tugmalari joylashuvini tanlang. Bu sozlama kino/serial katalog sahifalariga taalluqli; qism raqamlari o‘zgarmaydi.", reply_markup=kb)
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("pager_position:"))
+async def pager_position_save(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Faqat admin va owner uchun", show_alert=True)
+    value = call.data.split(":", 1)[1]
+    if value not in {"arrows_outside", "arrows_inside", "arrows_row"}:
+        return await call.answer("Noto‘g‘ri joylashuv", show_alert=True)
+    data = load_data()
+    data.setdefault("settings", {})["pager_position"] = value
+    save_data(data)
+    await pager_position_menu(call)
+    await call.answer("Joylashuv saqlandi")
 
 @dp.callback_query(F.data == "color_reset")
 async def color_reset(call: CallbackQuery):
