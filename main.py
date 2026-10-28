@@ -355,14 +355,14 @@ async def send_start(message: Message, user_id=None):
 
 
 def main_menu(user_id=None):
-    rows = [[
-        InlineKeyboardButton(text="🎬 Kino va serial izlash", callback_data="search_menu"),
-        InlineKeyboardButton(text="📖 Qo'llanma", callback_data="guide"),
-    ]]
-    if load_data().get("settings", {}).get("vip_enabled", False):
-        rows.insert(1, [InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")])
-        rows.insert(2, [InlineKeyboardButton(text="❓ VIP o'zi nima?", callback_data="vip_info")])
-        rows.append([InlineKeyboardButton(text="👤 Hisobim", callback_data="account")])
+    # Foydalanuvchi yuborgan namunadagi joylashuv; mavjud funksiyalar olib tashlanmaydi.
+    rows = [
+        [InlineKeyboardButton(text="🔎 Anime va Kino izlash", callback_data="search_menu")],
+        [InlineKeyboardButton(text="👤 Hisobim", callback_data="account"), InlineKeyboardButton(text="👥 Referal", callback_data="referral")],
+        [InlineKeyboardButton(text="💰 Balans", callback_data="account"), InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
+        [InlineKeyboardButton(text="❓ VIP o‘zi nima?", callback_data="vip_info")],
+        [InlineKeyboardButton(text="📖 Qo‘llanma", callback_data="guide")],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -442,14 +442,8 @@ def catalog_item_for_media(data: dict, media: dict):
 
 
 def build_pager_row(left_button, middle_button, right_button):
-    """Sahifalash qatorini admin sozlamasiga ko‘ra tuzadi; None tugmalar chiqarilmaydi."""
-    pos = load_data().get("settings", {}).get("pager_position", "arrows_outside")
-    if pos == "arrows_inside":
-        buttons = [b for b in (right_button, middle_button, left_button) if b is not None]
-    else:
-        buttons = [b for b in (left_button, middle_button, right_button) if b is not None]
-    if pos == "arrows_row":
-        return [[b] for b in buttons]
+    """Standart sahifalash: ⬅️ 1/3 ➡️. Episode raqamlari bundan mustasno."""
+    buttons = [b for b in (left_button, middle_button, right_button) if b is not None]
     return [buttons]
 
 
@@ -2445,6 +2439,25 @@ async def start_text_save(message: Message, state: FSMContext):
     await message.answer("✅ /start xabari o'zgartirildi.", reply_markup=admin_menu(message.from_user.id))
 
 
+@dp.callback_query(F.data == "referral")
+async def referral_callback(call: CallbackQuery):
+    try:
+        me = await call.bot.get_me()
+        link = f"https://t.me/{me.username}?start={call.from_user.id}"
+        data = load_data()
+        referrals = sum(1 for u in data.get("users", {}).values() if str(u.get("referrer", "")) == str(call.from_user.id))
+        reward = data.get("settings", {}).get("referral_reward", 5000)
+        text = (f"👥 <b>Referal</b>\n\nDo‘stlaringizga havolani yuboring:\n<code>{link}</code>\n\n"
+                f"👤 Taklif qilganlar: {referrals}\n💰 Har bir referal uchun: {reward} so‘m")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
+        try:
+            await call.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await call.message.answer(text, reply_markup=kb)
+    finally:
+        await call.answer()
+
+
 @dp.callback_query(F.data == "account")
 async def account_callback(call: CallbackQuery):
     data = load_data()
@@ -2515,7 +2528,6 @@ async def appearance_menu(call: CallbackQuery):
         [InlineKeyboardButton(text=f"🔢 1/3 sahifa ko‘rsatkichi: {colors.get('page_indicator', 'standart')}", callback_data="color_group:page_indicator")],
         [InlineKeyboardButton(text=f"⬅️ Orqaga tugmalari: {colors.get('back', 'standart')}", callback_data="color_group:back")],
         [InlineKeyboardButton(text=f"🧩 Boshqa tugmalar: {colors.get('other', 'standart')}", callback_data="color_group:other")],
-        [InlineKeyboardButton(text="↔️ Sahifalash tugmalari joylashuvi", callback_data="pager_position_menu")],
         [InlineKeyboardButton(text="🌈 Barcha tugmalar", callback_data="color_group:all")],
         [InlineKeyboardButton(text="♻️ Ranglarni tozalash", callback_data="color_reset")],
         [InlineKeyboardButton(text="✏️ Tugma nomlarini o‘zgartirish", callback_data="button_text_menu")],
@@ -2559,33 +2571,7 @@ async def color_set_save(call: CallbackQuery):
     await call.answer("Rang saqlandi")
 
 
-@dp.callback_query(F.data == "pager_position_menu")
-async def pager_position_menu(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Faqat admin va owner uchun", show_alert=True)
-    settings = load_data().get("settings", {})
-    pos = settings.get("pager_position", "arrows_outside")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=("✅ ⬅️ 1/3 ➡️" if pos == "arrows_outside" else "⬅️ 1/3 ➡️"), callback_data="pager_position:arrows_outside")],
-        [InlineKeyboardButton(text=("✅ ➡️ 1/3 ⬅️" if pos == "arrows_inside" else "➡️ 1/3 ⬅️"), callback_data="pager_position:arrows_inside")],
-        [InlineKeyboardButton(text=("✅ Strelkalarni alohida qatorga" if pos == "arrows_row" else "Strelkalarni alohida qatorga"), callback_data="pager_position:arrows_row")],
-        [InlineKeyboardButton(text="⬅️ Ranglar menyusi", callback_data="appearance")],
-    ])
-    await call.message.answer("Sahifalash tugmalari joylashuvini tanlang. Bu sozlama kino/serial katalog sahifalariga taalluqli; qism raqamlari o‘zgarmaydi.", reply_markup=kb)
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("pager_position:"))
-async def pager_position_save(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return await call.answer("Faqat admin va owner uchun", show_alert=True)
-    value = call.data.split(":", 1)[1]
-    if value not in {"arrows_outside", "arrows_inside", "arrows_row"}:
-        return await call.answer("Noto‘g‘ri joylashuv", show_alert=True)
-    data = load_data()
-    data.setdefault("settings", {})["pager_position"] = value
-    save_data(data)
-    await pager_position_menu(call)
-    await call.answer("Joylashuv saqlandi")
+# Sahifalash joylashuvini o‘zgartirish funksiyasi olib tashlandi; standart ⬅️ 1/3 ➡️ saqlanadi.
 
 @dp.callback_query(F.data == "color_reset")
 async def color_reset(call: CallbackQuery):
