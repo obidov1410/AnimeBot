@@ -43,7 +43,9 @@ def InlineKeyboardButton(*, text, **kwargs):
         _group = _button_color_group(_cb, str(text))
         _color = _colors.get(_group) or _colors.get("all")
         if _color in ("primary", "success", "danger"):
-            kwargs.setdefault("style", _color)
+            # Telegram Bot API button style; set explicitly so an old/default style
+            # cannot override the admin's saved selection.
+            kwargs["style"] = _color
     except Exception:
         pass
     return TelegramInlineKeyboardButton(text=small_caps(text), **kwargs)
@@ -56,6 +58,9 @@ def _button_color_group(callback_data, text=""):
     if cb.startswith(("season_page:", "media_page:")):
         if "⬅" in str(text): return "page_left"
         if "➡" in str(text): return "page_right"
+    # Also catch pager buttons if their callback data changes in a future menu.
+    if cb == "page_info" or re.fullmatch(r"\d+\s*/\s*\d+", str(text).strip()):
+        return "page_indicator"
     if cb in ("home", "admin_home") or "Orqaga" in text or "Asosiy menyu" in text:
         return "back"
     if cb.startswith(("episode:", "show:", "season_show:", "catalog_show:")) or cb in ("list", "movie_list", "continue_watching"):
@@ -375,6 +380,7 @@ def search_menu(user_id=None):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔢 Kod bo'yicha izlash", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo'yicha izlash", callback_data="search_name")],
         [InlineKeyboardButton(text="🎞 Kinolar ro'yxati", callback_data="category_list:movie"), InlineKeyboardButton(text="📺 Seriallar ro'yxati", callback_data="category_list:series")],
+        [InlineKeyboardButton(text="🍥 Anime ro'yxati", callback_data="category_list:anime"), InlineKeyboardButton(text="🎨 Multfilmlar ro'yxati", callback_data="category_list:cartoon")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
     ])
 
