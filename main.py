@@ -349,10 +349,10 @@ async def send_start(message: Message, user_id=None):
 
 
 def main_menu(user_id=None):
-    rows = [
-        [InlineKeyboardButton(text="🎬 Kino va serial izlash", callback_data="search_menu")],
-        [InlineKeyboardButton(text="📖 Qo'llanma", callback_data="guide")],
-    ]
+    rows = [[
+        InlineKeyboardButton(text="🎬 Kino va serial izlash", callback_data="search_menu"),
+        InlineKeyboardButton(text="📖 Qo'llanma", callback_data="guide"),
+    ]]
     if load_data().get("settings", {}).get("vip_enabled", False):
         rows.insert(1, [InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")])
         rows.insert(2, [InlineKeyboardButton(text="❓ VIP o'zi nima?", callback_data="vip_info")])
@@ -366,13 +366,9 @@ def main_reply_keyboard():
 
 
 def search_menu(user_id=None):
-    # Kataloglar alohida ro'yxatlarni ochadi; kod va nom bo'yicha qidiruv alohida qoladi.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎞 Kinolar ro'yxati", callback_data="category_list:movie")],
-        [InlineKeyboardButton(text="🍥 Anime ro'yxati", callback_data="category_list:anime")],
-        [InlineKeyboardButton(text="🎨 Multiklar ro'yxati", callback_data="category_list:cartoon")],
-        [InlineKeyboardButton(text="📺 Seriallar ro'yxati", callback_data="category_list:series")],
         [InlineKeyboardButton(text="🔢 Kod bo'yicha izlash", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo'yicha izlash", callback_data="search_name")],
+        [InlineKeyboardButton(text="🎞 Kinolar ro'yxati", callback_data="category_list:movie"), InlineKeyboardButton(text="📺 Seriallar ro'yxati", callback_data="category_list:series")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
     ])
 
@@ -1359,7 +1355,7 @@ async def catalog_send_part(call: CallbackQuery):
     user["last_watched"] = {"catalog_key": key, "code": matched_code, "number": number, "media_type": "movie", "updated_at": now_ts()}
     save_data(data)
     try:
-        await bot.copy_message(chat_id=call.from_user.id, from_chat_id=part["chat_id"], message_id=part["message_id"], protect_content=True)
+        await bot.copy_message(chat_id=call.from_user.id, from_chat_id=part["chat_id"], message_id=part["message_id"], protect_content=False)
         await call.answer(f"{number}-qism yuborildi")
     except Exception:
         logging.exception("Catalog part copy failed")
@@ -1520,7 +1516,7 @@ async def send_episode(call: CallbackQuery):
         user = current_data.setdefault("users", {}).setdefault(str(call.from_user.id), {})
         user["last_watched"] = {"code": code, "season": season_number, "number": number, "media_type": media.get("media_type", "series"), "updated_at": now_ts()}
         save_data(current_data)
-        protect = True
+        protect = False
         available_numbers = []
         for ep_no, ep_rec in season_data.get("episodes", {}).items():
             if isinstance(ep_rec, dict) and ("file_id" in ep_rec or "chat_id" in ep_rec or "regular" in ep_rec):
@@ -1696,28 +1692,7 @@ async def show_media(call: CallbackQuery):
             pass
     item = data["medias"][code]
     await send_media_card(call.from_user.id, code, item)
-    # Agar 1-faslning 1-qismi saqlangan bo'lsa, nom tanlanganda avtomatik yuboramiz.
-    seasons = item.get("seasons") or {"1": {"episodes": item.get("episodes", {})}}
-    first_season = sorted(seasons, key=lambda v: int(v) if str(v).isdigit() else 999999)[0] if seasons else "1"
-    first_eps = seasons.get(first_season, {}).get("episodes", {})
-    first_record = first_eps.get("1")
-    if isinstance(first_record, dict):
-        tier = "regular"
-        episode = first_record.get(tier) if isinstance(first_record.get(tier), dict) else first_record
-        if not episode and isinstance(first_record.get("regular"), dict): episode = first_record.get("regular")
-        if isinstance(episode, dict):
-            available = [str(n) for n, rec in first_eps.items() if isinstance(rec, dict) and ("file_id" in rec or "chat_id" in rec or tier in rec)]
-            nav = episode_navigation_keyboard(code, first_season, "1", available)
-            protect = True
-            try:
-                if episode.get("file_id"):
-                    media_type = episode.get("media_type", "video")
-                    send_method = {"video": bot.send_video, "document": bot.send_document, "audio": bot.send_audio, "animation": bot.send_animation, "photo": bot.send_photo, "voice": bot.send_voice}.get(media_type, bot.send_video)
-                    await send_method(chat_id=call.from_user.id, **{media_type: episode["file_id"]}, caption=episode.get("caption") or f"🎬 <b>{item.get('name','Kontent')}</b> — 1-qism", protect_content=protect, reply_markup=nav)
-                elif episode.get("chat_id") and episode.get("message_id"):
-                    await bot.copy_message(chat_id=call.from_user.id, from_chat_id=episode["chat_id"], message_id=episode["message_id"], protect_content=protect, reply_markup=nav)
-            except Exception as exc:
-                logging.warning("Avtomatik 1-qism yuborilmadi (%s): %s", code, exc)
+    # Faqat poster va mavjud qismlar tugmalari ko'rsatiladi; qism avtomatik yuborilmaydi.
     await call.answer()
 
 
@@ -1890,10 +1865,15 @@ async def notify_content_added(code: str, item: dict):
     data = load_data()
     is_movie = item.get("media_type") == "movie"
     label = "KINO" if is_movie else "SERIAL"
-    text = (f"🎉 <b>BAZAMIZGA YANGI {label} QO‘SHILDI!</b>\n\n"
-            f"🎬 Nomi: <b>{item.get('name', 'Nomsiz')}</b>\n"
-            f"🔢 Kodi: <code>{code}</code>\n\n"
-            "Tomosha qilish uchun quyidagi tugmani bosing!")
+    years = item.get("year", "") or item.get("years", "") or "Yili ko'rsatilmagan"
+    genre = item.get("genre", "") or item.get("genres", "") or "Janr ko'rsatilmagan"
+    seasons = item.get("seasons") or {"1": {"episodes": item.get("episodes", {})}}
+    episode_count = sum(len(v.get("episodes", {})) for v in seasons.values() if isinstance(v, dict))
+    text = (f"🔥 <b>Premyera!</b>\n\n"
+            f"🎬 {item.get('name', 'Nomsiz')}\n"
+            f"{years} · {genre}\n"
+            f"📺 {episode_count} qism\n\n"
+            f"📥 Barcha qismlar tayyor — hoziroq <code>{code}</code> kodi orqali yuklab oling!👇")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Tomosha qilish", callback_data=f"show:{code}")]])
     if not data.get("settings", {}).get("notify_new_content", True):
         return
@@ -2001,8 +1981,18 @@ async def episode_batch_message(message: Message, state: FSMContext):
         await state.clear()
         return await message.answer(f"✅ Yakunlandi. {count} ta qism saqlandi.", reply_markup=admin_menu(message.from_user.id))
     if text == "/cancel":
+        saved = await state.get_data()
+        code = str(saved.get("batch_code", "")); season_no = str(saved.get("batch_season", "1"))
+        added = saved.get("batch_added", [])
+        data = load_data(); item = data.get("medias", {}).get(code)
+        if item:
+            eps = item.get("seasons", {}).get(season_no, {}).get("episodes", {})
+            for n in added:
+                eps.pop(str(n), None)
+                if season_no == "1": item.get("episodes", {}).pop(str(n), None)
+            save_data(data)
         await state.clear()
-        return await message.answer("❎ Bekor qilindi.", reply_markup=admin_menu(message.from_user.id))
+        return await message.answer("❎ Bekor qilindi. Shu jarayonda qo'shilgan qismlar olib tashlandi; avvalgi qismlar saqlandi.", reply_markup=admin_menu(message.from_user.id))
 
     # Media istalgan manbadan qabul qilinadi: kanal, mavzu, guruh yoki shaxsiy chat.
     # Faylni serverga yuklamaymiz; Telegram file_id yoki kerak bo'lsa source message saqlanadi.
@@ -2032,16 +2022,18 @@ async def episode_batch_message(message: Message, state: FSMContext):
     episodes = season.setdefault("episodes", {})
     numeric = [int(n) for n in episodes if str(n).isdigit()]
     number = max(numeric, default=0) + 1
-    if file_id:
+    if origin_chat and origin_message_id:
+        # Original postni copy_message orqali yuborish cover/banner va captionni saqlashga yordam beradi.
+        record = {"chat_id": origin_chat.id, "message_id": origin_message_id, "media_type": media_type or "video"}
+    elif file_id:
         record = {"file_id": file_id, "media_type": media_type or "video", "caption": (message.caption or "")[:900]}
-    else:
-        record = {"chat_id": origin_chat.id, "message_id": origin_message_id}
     episodes[str(number)] = record
     if season_no == "1":
         item.setdefault("episodes", {})[str(number)] = record
     save_data(data)
     count = int(saved.get("batch_count", 0)) + 1
-    await state.update_data(batch_count=count)
+    added = list(saved.get("batch_added", [])); added.append(str(number))
+    await state.update_data(batch_count=count, batch_added=added)
     progress_id = saved.get("progress_message_id")
     if progress_id:
         try:
@@ -2187,7 +2179,19 @@ async def delete_episode_save(message: Message, state: FSMContext):
     code = saved["delete_episode_code"]
     if code not in data["medias"] or number not in data["medias"][code]["episodes"]:
         return await message.answer("❌ Bunday qism topilmadi. Qism raqamini qayta yuboring:")
-    del data["medias"][code]["episodes"][number]
+    media = data["medias"][code]
+    removed = False
+    seasons = media.get("seasons", {})
+    for season_no, season_data in seasons.items():
+        eps = season_data.get("episodes", {})
+        if number in eps:
+            del eps[number]; removed = True
+            if str(season_no) == "1": media.get("episodes", {}).pop(number, None)
+            break
+    if not removed and number in media.get("episodes", {}):
+        del media["episodes"][number]; removed = True
+    if not removed:
+        return await message.answer("❌ Bunday qism topilmadi. Qism raqamini qayta yuboring:")
     save_data(data)
     await state.clear()
     await message.answer(f"🗑 {number}-qism o'chirildi.", reply_markup=admin_menu(message.from_user.id))
