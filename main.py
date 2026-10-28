@@ -41,11 +41,16 @@ def InlineKeyboardButton(*, text, **kwargs):
             text = _custom_text
         _colors = _cfg.get("button_colors", {})
         _group = _button_color_group(_cb, str(text))
-        _color = _colors.get(_group) or _colors.get("all")
+        # Aniq guruh sozlamasi doim "barcha tugmalar" sozlamasidan ustun.
+        # Guruh uchun "default" tanlansa ham, umumiy rangga qaytib ketmasin.
+        if _group in _colors:
+            _color = _colors[_group]
+        else:
+            _color = _colors.get("all")
         if _color in ("primary", "success", "danger"):
-            # Telegram Bot API button style; set explicitly so an old/default style
-            # cannot override the admin's saved selection.
             kwargs["style"] = _color
+        elif _color == "default":
+            kwargs.pop("style", None)
     except Exception:
         pass
     return TelegramInlineKeyboardButton(text=small_caps(text), **kwargs)
@@ -2570,8 +2575,9 @@ async def color_set_save(call: CallbackQuery):
         return await call.answer("Noto‘g‘ri rang", show_alert=True)
     data = load_data()
     colors = data.setdefault("settings", {}).setdefault("button_colors", {})
-    if color == "default": colors.pop(group, None)
-    else: colors[group] = color
+    # "default" ham alohida qiymat sifatida saqlanadi: shu orqali "all" rangi
+    # tanlangan bo‘lsa ham bitta guruhni standart rangda qoldirish mumkin.
+    colors[group] = color
     save_data(data)
     await appearance_menu(call)
     await call.answer("Rang saqlandi")
