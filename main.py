@@ -1554,7 +1554,20 @@ async def send_episode(call: CallbackQuery):
                 "photo": bot.send_photo,
                 "voice": bot.send_voice,
             }.get(media_type, bot.send_video)
-            await send_method(chat_id=call.from_user.id, **{media_type: file_id}, caption=caption, protect_content=protect, reply_markup=nav_markup)
+            send_kwargs = {
+                "chat_id": call.from_user.id,
+                media_type: file_id,
+                "caption": caption,
+                "protect_content": protect,
+                "reply_markup": nav_markup,
+            }
+            # Bot API 8.3+: video cover is separate from the video file_id.
+            # Old records may not contain cover_id, so keep them compatible.
+            if media_type == "video" and episode.get("cover_id"):
+                send_kwargs["cover"] = episode["cover_id"]
+            if media_type == "video" and episode.get("start_timestamp") is not None:
+                send_kwargs["start_timestamp"] = episode["start_timestamp"]
+            await send_method(**send_kwargs)
         elif "chat_id" in episode and "message_id" in episode:
             await bot.copy_message(chat_id=call.from_user.id, from_chat_id=episode["chat_id"], message_id=episode["message_id"], protect_content=protect, reply_markup=nav_markup)
         else:
@@ -2015,11 +2028,18 @@ async def episode_batch_message(message: Message, state: FSMContext):
     # Faylni serverga yuklamaymiz; Telegram file_id yoki kerak bo'lsa source message saqlanadi.
     media_type = None
     file_id = None
+    cover_id = None
+    start_timestamp = None
     for attr in ("video", "document", "audio", "animation", "photo", "voice"):
         obj = getattr(message, attr, None)
         if obj:
             media_type = attr
             file_id = (obj[-1].file_id if attr == "photo" else obj.file_id)
+            if attr == "video":
+                covers = getattr(obj, "cover", None) or []
+                if covers:
+                    cover_id = covers[-1].file_id
+                start_timestamp = getattr(obj, "start_timestamp", None)
             break
     origin = getattr(message, "forward_origin", None)
     origin_chat = getattr(origin, "chat", None) if origin else None
@@ -2040,10 +2060,18 @@ async def episode_batch_message(message: Message, state: FSMContext):
     numeric = [int(n) for n in episodes if str(n).isdigit()]
     number = max(numeric, default=0) + 1
     if origin_chat and origin_message_id:
-        # Original postni copy_message orqali yuborish cover/banner va captionni saqlashga yordam beradi.
+        # Asl postni nusxalash media xabari va mavjud coverni saqlash uchun afzal.
         record = {"chat_id": origin_chat.id, "message_id": origin_message_id, "media_type": media_type or "video"}
+        if cover_id:
+            record["cover_id"] = cover_id
+        if start_timestamp is not None:
+            record["start_timestamp"] = start_timestamp
     elif file_id:
         record = {"file_id": file_id, "media_type": media_type or "video", "caption": (message.caption or "")[:900]}
+        if cover_id:
+            record["cover_id"] = cover_id
+        if start_timestamp is not None:
+            record["start_timestamp"] = start_timestamp
     episodes[str(number)] = record
     if season_no == "1":
         item.setdefault("episodes", {})[str(number)] = record
