@@ -196,7 +196,7 @@ def default_data():
         "channel_catalog": {},
         "users": {},
         "banned_users": [],
-        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "maintenance": False, "vip_enabled": False, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
+        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "maintenance": False, "vip_enabled": False, "vip_save_protection": True, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
     }
 
 
@@ -427,6 +427,7 @@ def owner_menu():
         [InlineKeyboardButton(text="🗄 Zaxira kanalini o'zgartirish", callback_data="backup_channel_change")],
         [InlineKeyboardButton(text="🛠 Texnik tanaffus: holat", callback_data="owner_maintenance")],
         [InlineKeyboardButton(text=("💎 VIP: O'CHIRISH" if load_data().get("settings", {}).get("vip_enabled", False) else "💎 VIP: YOQISH"), callback_data="owner_vip")],
+        [InlineKeyboardButton(text=("🔐 Saqlash himoyasi: YOQILGAN" if load_data().get("settings", {}).get("vip_save_protection", True) else "🔓 Saqlash himoyasi: O'CHIRILGAN"), callback_data="owner_save_protection")],
         [InlineKeyboardButton(text="📣 Hammaga xabar yuborish", callback_data="broadcast")],
         [InlineKeyboardButton(text="⚙️ Bot sozlamalari", callback_data="owner_settings")],
         [InlineKeyboardButton(text="👥 Obunachilarni boshqarish", callback_data="manage_users")],
@@ -535,6 +536,20 @@ def media_caption(code: str, media: dict) -> str:
     if description:
         base += "\n\n" + description
     return base[:1024]
+
+
+def is_vip_user(user_id: int, data=None) -> bool:
+    """Foydalanuvchining VIP muddati hali tugamaganini tekshiradi."""
+    data = data or load_data()
+    user = data.get("users", {}).get(str(user_id), {})
+    return int(user.get("vip_until", 0) or 0) > now_ts()
+
+
+def should_protect_content(user_id: int, data=None) -> bool:
+    """Himoya yoqilgan bo‘lsa, faqat VIP bo‘lmaganlarga saqlash/forwardni cheklaydi."""
+    data = data or load_data()
+    enabled = bool(data.get("settings", {}).get("vip_save_protection", True))
+    return enabled and not is_vip_user(user_id, data)
 
 
 def media_available_for_user(user_id: int, media: dict, data=None) -> bool:
@@ -948,6 +963,28 @@ async def owner_vip_callback(call: CallbackQuery):
     await call.message.answer(f"💎 VIP rejimi {status}. {detail}", reply_markup=owner_menu())
     await call.answer()
 
+@dp.callback_query(F.data == "owner_save_protection")
+async def owner_save_protection_callback(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data()
+    cfg = data.setdefault("settings", {})
+    cfg["vip_save_protection"] = not bool(cfg.get("vip_save_protection", True))
+    save_data(data)
+    status = "YOQILDI" if cfg["vip_save_protection"] else "O‘CHIRILDI"
+    detail = (
+        "VIP bo‘lmaganlar kontentni saqlay/forward qila olmaydi; VIP foydalanuvchilar erkin foydalanadi."
+        if cfg["vip_save_protection"] else
+        "Barcha foydalanuvchilar kontentni saqlash va forward qilish imkoniga ega."
+    )
+    try:
+        await call.message.edit_reply_markup(reply_markup=owner_menu())
+    except Exception:
+        pass
+    await call.message.answer(f"🔐 Saqlash himoyasi {status}.\n{detail}", reply_markup=owner_menu())
+    await call.answer()
+
+
 @dp.callback_query(F.data == "vip_info")
 async def vip_info_callback(call: CallbackQuery):
     cfg = load_data().get("settings", {})
@@ -1234,8 +1271,20 @@ async def search_menu_open(call: CallbackQuery):
 
 @dp.callback_query(F.data == "guide")
 async def guide(call: CallbackQuery):
-    text = "📖 <b>Qo'llanma</b>"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛑 Orqaga", callback_data="home")]])
+    text = (
+        "📖 <b>Botdan foydalanish qo‘llanmasi</b>\n\n"
+        "1️⃣ <b>Kino qidirish</b> tugmasini bosing.\n"
+        "2️⃣ Kerakli kontentni kod yoki nomi orqali qidiring.\n"
+        "3️⃣ Chiqqan nomni tanlang — kino yoki serial ma’lumotlari ochiladi.\n"
+        "4️⃣ Serial bo‘lsa, kerakli faslni, keyin qism raqamini bosing.\n"
+        "5️⃣ Qism ochilgach, pastdagi ⬅️ va ➡️ tugmalari bilan oldingi yoki keyingi qismga o‘ting.\n\n"
+        "🔒 Agar bot majburiy kanalga obuna bo‘lishni so‘rasa, kanallarga qo‘shiling va «Obunani tekshirish»ni bosing.\n"
+        "💎 Saqlash himoyasi yoqilganida VIP bo‘lmaganlar yuborilgan videoni Telegram orqali saqlay yoki boshqa joyga uzata olmaydi. VIP foydalanuvchilarga bu cheklov qo‘yilmaydi."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Kino qidirish", callback_data="search_menu")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]
+    ])
     try:
         await call.message.edit_text(text, reply_markup=kb)
     except Exception:
@@ -1375,7 +1424,8 @@ async def catalog_send_part(call: CallbackQuery):
     user["last_watched"] = {"catalog_key": key, "code": matched_code, "number": number, "media_type": "movie", "updated_at": now_ts()}
     save_data(data)
     try:
-        await bot.copy_message(chat_id=call.from_user.id, from_chat_id=part["chat_id"], message_id=part["message_id"], protect_content=False)
+        protect = should_protect_content(call.from_user.id, data)
+        await bot.copy_message(chat_id=call.from_user.id, from_chat_id=part["chat_id"], message_id=part["message_id"], protect_content=protect)
         await call.answer(f"{number}-qism yuborildi")
     except Exception:
         logging.exception("Catalog part copy failed")
@@ -1536,7 +1586,7 @@ async def send_episode(call: CallbackQuery):
         user = current_data.setdefault("users", {}).setdefault(str(call.from_user.id), {})
         user["last_watched"] = {"code": code, "season": season_number, "number": number, "media_type": media.get("media_type", "series"), "updated_at": now_ts()}
         save_data(current_data)
-        protect = False
+        protect = should_protect_content(call.from_user.id, current_data)
         available_numbers = []
         for ep_no, ep_rec in season_data.get("episodes", {}).items():
             if isinstance(ep_rec, dict) and ("file_id" in ep_rec or "chat_id" in ep_rec or "regular" in ep_rec):
@@ -1900,9 +1950,8 @@ async def notify_content_added(code: str, item: dict):
     seasons = item.get("seasons") or {"1": {"episodes": item.get("episodes", {})}}
     episode_count = sum(len(v.get("episodes", {})) for v in seasons.values() if isinstance(v, dict))
     text = (f"🔥 <b>Premyera!</b>\n\n"
-            f"🎬 {item.get('name', 'Nomsiz')}\n"
-            f"{years} · {genre}\n"
-            f"📺 {episode_count} qism\n\n"
+            f"🎬 Nomi: {item.get('name', 'Nomsiz')}\n"
+            f"Kodi: <code>{code}</code>\n\n"
             f"📥 Barcha qismlar tayyor — hoziroq <code>{code}</code> kodi orqali yuklab oling!👇")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Tomosha qilish", callback_data=f"show:{code}")]])
     if not data.get("settings", {}).get("notify_new_content", True):
