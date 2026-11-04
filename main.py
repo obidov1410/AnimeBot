@@ -68,6 +68,8 @@ def _button_color_group(callback_data, text=""):
         return "page_indicator"
     if cb in ("home", "admin_home") or "Orqaga" in text or "Asosiy menyu" in text:
         return "back"
+    if cb.startswith("episode:") and "Keyingi qism" in str(text):
+        return "next_episode"
     if cb.startswith(("episode:", "show:", "season_show:", "catalog_show:")) or cb in ("list", "movie_list", "continue_watching"):
         return "content"
     if cb in ("search", "search_name", "search_menu") or "qidirish" in text.casefold():
@@ -630,9 +632,15 @@ def parse_channel_entry(entry):
 
 
 async def check_subscription(user_id: int) -> bool:
-    channels = load_data().get("channels", [])
+    data = load_data()
+    channels = data.get("channels", [])
+    pending_requests = data.setdefault("join_requests", {})
+    requested_channel_ids = {str(x) for x in pending_requests.get(str(user_id), [])}
     for entry in channels:
         chat_ref, _invite_url, raw = parse_channel_entry(entry)
+        # Maxfiy kanalga qo'shilish so'rovi yuborilgan bo'lsa, admin tasdig'ini kutmaymiz.
+        if str(chat_ref) in requested_channel_ids:
+            continue
         try:
             member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
             # Restricted a'zolar ham is_member=True bo'lsa obunachi hisoblanadi.
@@ -2611,6 +2619,7 @@ async def appearance_menu(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🔎 Qidirish tugmalari: {colors.get('search', 'standart')}", callback_data="color_group:search")],
         [InlineKeyboardButton(text=f"🎬 Kontent tugmalari: {colors.get('content', 'standart')}", callback_data="color_group:content")],
+        [InlineKeyboardButton(text=f"⏭ Keyingi qism tugmasi: {colors.get('next_episode', 'standart')}", callback_data="color_group:next_episode")],
         [InlineKeyboardButton(text=f"⬅️ Katalog chap strelkasi: {colors.get('page_left', 'standart')}", callback_data="color_group:page_left")],
         [InlineKeyboardButton(text=f"➡️ Katalog o‘ng strelkasi: {colors.get('page_right', 'standart')}", callback_data="color_group:page_right")],
         [InlineKeyboardButton(text=f"🔢 1/3 sahifa ko‘rsatkichi: {colors.get('page_indicator', 'standart')}", callback_data="color_group:page_indicator")],
@@ -2630,7 +2639,7 @@ async def color_group_select(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return await call.answer("Faqat admin va owner uchun", show_alert=True)
     group = call.data.split(":", 1)[1]
-    if group not in {"search", "content", "back", "other", "all", "page_left", "page_right", "page_indicator"}:
+    if group not in {"search", "content", "next_episode", "back", "other", "all", "page_left", "page_right", "page_indicator"}:
         return await call.answer("Noto‘g‘ri guruh", show_alert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🟥 Qizil", callback_data=f"color_set:{group}:danger")],
@@ -2648,7 +2657,7 @@ async def color_set_save(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return await call.answer("Faqat admin va owner uchun", show_alert=True)
     _, group, color = call.data.split(":", 2)
-    if group not in {"search", "content", "back", "other", "all", "page_left", "page_right", "page_indicator"} or color not in {"danger", "success", "primary", "default"}:
+    if group not in {"search", "content", "next_episode", "back", "other", "all", "page_left", "page_right", "page_indicator"} or color not in {"danger", "success", "primary", "default"}:
         return await call.answer("Noto‘g‘ri rang", show_alert=True)
     data = load_data()
     colors = data.setdefault("settings", {}).setdefault("button_colors", {})
@@ -2797,6 +2806,29 @@ async def broadcast_send(message: Message, state: FSMContext):
             logging.info("Broadcast %s ga yuborilmadi: %s", uid, exc)
         await asyncio.sleep(0.04)
     await message.answer(f"📣 Xabar yuborish tugadi.\n✅ Yetkazildi: {sent}\n❌ Yetkazilmadi: {failed}", reply_markup=owner_menu())
+
+
+@dp.chat_join_request()
+async def remember_channel_join_request(event):
+    """Maxfiy majburiy kanalga so'rov yuborgan foydalanuvchini qayd etadi."""
+    try:
+        data = load_data()
+        configured_ids = set()
+        for entry in data.get("channels", []):
+            chat_ref, _invite_url, _raw = parse_channel_entry(entry)
+            configured_ids.add(str(chat_ref))
+        channel_id = str(event.chat.id)
+        if channel_id not in configured_ids:
+            return
+        requests = data.setdefault("join_requests", {})
+        user_key = str(event.from_user.id)
+        user_channels = {str(x) for x in requests.get(user_key, [])}
+        user_channels.add(channel_id)
+        requests[user_key] = sorted(user_channels)
+        save_data(data)
+        logging.info("Join request recorded: user=%s channel=%s", user_key, channel_id)
+    except Exception:
+        logging.exception("Join requestni saqlashda xatolik")
 
 
 @dp.callback_query(F.data == "check_sub")
