@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import hashlib
+import difflib
 import time
 import zipfile
 import io
@@ -1468,17 +1469,27 @@ async def search_name_result(message: Message, state: FSMContext):
     saved = await state.get_data()
     media_filter = saved.get("search_filter", "all")
     data = load_data()
-    matches = [(str(code), item) for code, item in data.get("medias", {}).items()
-               if item.get("media_type", "series") in {"movie", "series", "drama", "anime", "cartoon"}
-               and query in item.get("name", "").casefold()
-               and (media_filter == "all" or item.get("media_type", "series") == media_filter)
-               and media_available_for_user(message.from_user.id, item, data)]
-    # Prefix matches first, then substring matches, so results are easier to select.
-    matches.sort(key=lambda pair: (not pair[1].get("name", "").casefold().startswith(query), pair[1].get("name", "").casefold()))
+    candidates = [(str(code), item) for code, item in data.get("medias", {}).items()
+                  if item.get("media_type", "series") in {"movie", "series", "drama", "anime", "cartoon"}
+                  and (media_filter == "all" or item.get("media_type", "series") == media_filter)
+                  and media_available_for_user(message.from_user.id, item, data)]
+    # Avval aniq qism/substring, keyin imlo xatosiga o'xshash nomlar.
+    matches = []
+    normalized_query = re.sub(r"[^a-z0-9а-яё]", "", query)
+    for code, item in candidates:
+        name = str(item.get("name", ""))
+        folded = name.casefold()
+        normalized_name = re.sub(r"[^a-z0-9а-яё]", "", folded)
+        ratio = difflib.SequenceMatcher(None, normalized_query, normalized_name).ratio()
+        token_scores = [difflib.SequenceMatcher(None, normalized_query, token).ratio() for token in re.findall(r"[a-z0-9а-яё]+", folded)]
+        score = max([ratio] + token_scores)
+        if query in folded or (len(normalized_query) >= 3 and score >= (0.48 if len(normalized_query) <= 5 else 0.42)):
+            matches.append((code, item, score))
+    matches.sort(key=lambda pair: (query not in pair[1].get("name", "").casefold(), -pair[2], pair[1].get("name", "").casefold()))
     if not matches:
         return await message.answer("❌ Mos nom topilmadi. Boshqa nom yoki qismini yozib ko'ring:", reply_markup=search_menu(message.from_user.id))
     rows = []
-    for code, item in matches[:40]:
+    for code, item, _score in matches[:40]:
         icon = {"movie":"🎞", "series":"📺", "drama":"🎭", "anime":"🍥", "cartoon":"🎨"}.get(item.get("media_type"), "🎬")
         rows.append([InlineKeyboardButton(text=f"{icon} {item.get('name','Nomsiz')} · {code}", callback_data=f"show:{code}")])
     rows.append([InlineKeyboardButton(text="🔎 Yana qidirish", callback_data="search_name")])
@@ -2050,7 +2061,7 @@ async def episode_season_select(message: Message, state: FSMContext):
     await state.update_data(batch_season=season_no, batch_count=0)
     await state.set_state(Form.episode_batch)
     prompt = await message.answer(
-        f"🎬 <b>{item['name']}</b> · <b>{season_no}-fasl</b>\nQismlarni bittadan yuboring. Birinchi media 1-qism, ikkinchisi 2-qism bo‘ladi.\n/done — tugatish · /cancel — bekor qilish"
+        f"🎬 <b>{item['name']}</b> · <b>{season_no}-fasl</b>\nQismlarni bittadan yoki bir nechtasini ketma-ket yuboring. Bot tavsifdagi 1-qism, Qism: 2 va shunga o'xshash raqamlarni taniydi; raqam topilmasa navbatdagi bo'sh raqamni beradi.\n/done — tugatish · /cancel — bekor qilish"
     )
     await state.update_data(progress_message_id=prompt.message_id)
 
@@ -2115,7 +2126,18 @@ async def episode_batch_message(message: Message, state: FSMContext):
     season = item.setdefault("seasons", {}).setdefault(season_no, {"episodes": {}})
     episodes = season.setdefault("episodes", {})
     numeric = [int(n) for n in episodes if str(n).isdigit()]
-    number = max(numeric, default=0) + 1
+    next_number = max(numeric, default=0) + 1
+    caption_text = " ".join(filter(None, [message.caption or "", message.text or ""]))
+    episode_patterns = [r"(?:qism|episode|ep)\s*[:._-]?\s*(\d+)", r"(\d+)\s*[-._ ]?\s*(?:qism|episode|ep)\b"]
+    detected_number = None
+    for pattern in episode_patterns:
+        found = re.search(pattern, caption_text, flags=re.IGNORECASE)
+        if found:
+            detected_number = int(found.group(1))
+            break
+    number = detected_number if detected_number and detected_number > 0 else next_number
+    if str(number) in episodes:
+        return await message.answer(f"⚠️ {number}-qism avvaldan mavjud. Takroriy qism saqlanmadi. Tavsifdagi raqamni tekshiring yoki avvalgi qismni o'chiring.")
     if origin_chat and origin_message_id:
         # Asl postni nusxalash media xabari va mavjud coverni saqlash uchun afzal.
         record = {"chat_id": origin_chat.id, "message_id": origin_message_id, "media_type": media_type or "video"}
@@ -2140,7 +2162,7 @@ async def episode_batch_message(message: Message, state: FSMContext):
     if progress_id:
         try:
             await bot.edit_message_text(chat_id=message.chat.id, message_id=progress_id,
-                text=f"🎬 <b>{item['name']}</b> · {season_no}-fasl\n✅ {count} ta qism saqlandi. Oxirgisi: <b>{number}-qism</b>.\n\nKanal postlarini forward qilishda davom eting.\nTugatish: /done · Bekor qilish: /cancel")
+                text=f"🎬 <b>{item['name']}</b> · {season_no}-fasl\n✅ {count} ta media qabul qilindi. Oxirgisi: <b>{number}-qism</b>.\n\nPostlarni yuborishda davom eting.\nTugatish: /done · Bekor qilish: /cancel")
         except Exception:
             await message.answer(f"✅ {number}-qism saqlandi. Keyingi postni forward qiling yoki /done yozing.")
     else:
@@ -2598,11 +2620,18 @@ async def stats(call: CallbackQuery):
     cartoon_count = sum(1 for m in medias if m.get("media_type") == "cartoon")
     series_count = sum(1 for m in medias if m.get("media_type") in {"series", "drama"})
     downloads = data.get("downloads", {})
+    vip_ever = sum(1 for u in users if int(u.get("vip_until", 0) or 0) > 0)
+    vip_active = sum(1 for u in users if int(u.get("vip_until", 0) or 0) > now)
+    referral_total = sum(1 for u in users if u.get("referrer"))
+    referral_invites_recorded = sum(int(u.get("referrals_count", 0) or 0) for u in users)
+    referral_total = max(referral_total, referral_invites_recorded)
     def downloads_in(days):
         return sum(1 for t in downloads.values() if isinstance(t, (int, float)) and t >= now - days * 86400) if isinstance(downloads, dict) else 0
     await call.message.answer(
         f"📊 <b>Statistika</b>\n• Obunachilar soni: {len(users)} ta\n• Faol obunachilar: {active30} ta\n• Tark etganlar: {inactive} ta\n\n"
         f"📈 <b>Obunachilar qo‘shilishi</b>\n• Oxirgi 24 soat: +{joined_in(1)} obunachi\n• Oxirgi 7 kun: +{joined_in(7)} obunachi\n• Oxirgi 30 kun: +{joined_in(30)} obunachi\n\n"
+        f"💎 <b>VIP statistikasi</b>\n• VIP olganlar (qayd etilgan): {vip_ever} ta\n• Hozir VIP faol: {vip_active} ta\n\n"
+        f"👥 <b>Referal statistikasi</b>\n• Referal orqali kelganlar: {referral_total} ta\n\n"
         f"📊 <b>Faollik</b>\n• Oxirgi 24 soatda faol: {seen_in(1)} ta\n• Oxirgi 7 kun faol: {seen_in(7)} ta\n• Oxirgi 30 kun faol: {active30} ta\n\n"
         f"📥 <b>Yuklanishlar</b>\n• Oxirgi 24 soat: {downloads_in(1)} ta\n• Oxirgi 7 kun: {downloads_in(7)} ta\n• Oxirgi 30 kun: {downloads_in(30)} ta\n\n"
         f"🎬 Kinolar soni: {movie_count} ta\n🍥 Anime: {anime_count} ta\n🎨 Multfilm: {cartoon_count} ta\n📺 Serial/drama: {series_count} ta"
