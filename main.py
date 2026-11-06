@@ -690,6 +690,86 @@ async def check_subscription(user_id: int) -> bool:
     return True
 
 
+PURGE_TEXT = ("⚠️ <b>Diqqat!</b>\n\n"
+              "Siz majburiy obunadagi kanaldan chiqib ketganingiz sababli "
+              "chatdagi kinolar o'chirildi.\n\n"
+              "Qayta foydalanish uchun kanallarga obuna bo'ling yoki 💎 VIP oling.")
+
+
+def track_media_msg(user_id: int, message_id):
+    """Foydalanuvchiga yuborilgan kino (media) xabarini eslab qoladi."""
+    if not message_id:
+        return
+    data = load_data()
+    user = data.setdefault("users", {}).setdefault(str(user_id), {})
+    ids = [int(x) for x in (user.get("media_msgs") or [])]
+    ids.append(int(message_id))
+    user["media_msgs"] = ids[-300:]
+    save_data(data)
+
+
+async def purge_user_media(user_id: int, notify: bool = True) -> int:
+    """Obunadan chiqqan foydalanuvchi chatidan bot yuborgan kinolarni o'chiradi.
+    Matnlar va tugmalar tegilmaydi. VIP foydalanuvchilar ozod."""
+    data = load_data()
+    if is_vip_user(user_id, data):
+        return 0
+    user = data.get("users", {}).get(str(user_id))
+    if not user:
+        return 0
+    ids = [int(x) for x in (user.get("media_msgs") or [])]
+    if not ids:
+        return 0
+    deleted = 0
+    for mid in ids:
+        try:
+            await bot.delete_message(user_id, mid)
+            deleted += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.04)
+    user["media_msgs"] = []
+    save_data(data)
+    if notify and deleted:
+        try:
+            await bot.send_message(user_id, PURGE_TEXT)
+        except Exception:
+            pass
+    return deleted
+
+
+async def enforce_subscription(user_id: int) -> bool:
+    """Obunani tekshiradi; chiqqan bo'lsa chatdagi kinolarni o'chiradi."""
+    if await check_subscription(user_id):
+        return True
+    await purge_user_media(user_id)
+    return False
+
+
+async def media_monitor():
+    """Har 10 daqiqada obunadan chiqqanlarni tekshirib, kinolarini o'chiradi."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            data = load_data()
+            if data.get("channels"):
+                for uid_str, user in list(data.get("users", {}).items()):
+                    if not user.get("media_msgs"):
+                        continue
+                    try:
+                        uid = int(uid_str)
+                    except Exception:
+                        continue
+                    if is_vip_user(uid, data):
+                        continue
+                    if not await check_subscription(uid):
+                        await purge_user_media(uid)
+                    await asyncio.sleep(0.05)
+        except Exception:
+            logging.exception("Media monitor error")
+        await asyncio.sleep(600)
+
+
 def subscription_keyboard():
     rows = []
     for entry in load_data().get("channels", []):
@@ -714,7 +794,7 @@ async def require_subscription_message(message: Message) -> bool:
     if mute_until > now_ts():
         await message.answer(f"🔇 Botdan foydalanish vaqtincha cheklangan.\nQayta foydalanish: {fmt_date(mute_until)}")
         return False
-    if await check_subscription(message.from_user.id):
+    if await enforce_subscription(message.from_user.id):
         return True
     await message.answer(
         "🔒 <b>Botdan foydalanishdan oldin majburiy kanallarga obuna bo'ling.</b>\n\n"
@@ -738,7 +818,7 @@ async def start(message: Message, state: FSMContext):
     _u = data.get("users", {}).get(str(message.from_user.id), {})
     if int(_u.get("mute_until", 0) or 0) > now_ts():
         return await message.answer(f"🔇 Botdan foydalanish vaqtincha cheklangan.\nQayta foydalanish: {fmt_date(int(_u['mute_until']))}")
-    if not await check_subscription(message.from_user.id):
+    if not await enforce_subscription(message.from_user.id):
         return await message.answer("🔒 <b>Botdan foydalanishdan oldin majburiy kanallarga obuna bo‘ling.</b>\n\n📢 Kanallarga qo'shiling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
     await send_start(message)
 
@@ -1655,7 +1735,7 @@ async def catalog_show(call: CallbackQuery):
         return await call.answer("❌ Bu kino bazada topilmadi.", show_alert=True)
     if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
         return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
-    if not await check_subscription(call.from_user.id):
+    if not await enforce_subscription(call.from_user.id):
         await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
         return await call.answer()
     parts = item.get("parts", {})
@@ -1689,7 +1769,7 @@ async def catalog_send_part(call: CallbackQuery):
         return await call.answer("❌ Qism topilmadi.", show_alert=True)
     if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
         return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
-    if not await check_subscription(call.from_user.id):
+    if not await enforce_subscription(call.from_user.id):
         await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
         return await call.answer()
     user = data.setdefault("users", {}).setdefault(str(call.from_user.id), {})
@@ -1698,7 +1778,8 @@ async def catalog_send_part(call: CallbackQuery):
     save_data(data)
     try:
         protect = should_protect_content(call.from_user.id, data)
-        await bot.copy_message(chat_id=call.from_user.id, from_chat_id=part["chat_id"], message_id=part["message_id"], protect_content=protect)
+        sent = await bot.copy_message(chat_id=call.from_user.id, from_chat_id=part["chat_id"], message_id=part["message_id"], protect_content=protect)
+        track_media_msg(call.from_user.id, getattr(sent, "message_id", None))
         await call.answer(f"{number}-qism yuborildi")
     except Exception:
         logging.exception("Catalog part copy failed")
@@ -1833,7 +1914,7 @@ async def send_episode(call: CallbackQuery):
     data = load_data()
     if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
         return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
-    if not await check_subscription(call.from_user.id):
+    if not await enforce_subscription(call.from_user.id):
         await call.message.answer(
             "🔒 Avval kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard()
         )
@@ -1900,9 +1981,11 @@ async def send_episode(call: CallbackQuery):
                 send_kwargs["cover"] = episode["cover_id"]
             if media_type == "video" and episode.get("start_timestamp") is not None:
                 send_kwargs["start_timestamp"] = episode["start_timestamp"]
-            await send_method(**send_kwargs)
+            sent = await send_method(**send_kwargs)
+            track_media_msg(call.from_user.id, getattr(sent, "message_id", None))
         elif "chat_id" in episode and "message_id" in episode:
-            await bot.copy_message(chat_id=call.from_user.id, from_chat_id=episode["chat_id"], message_id=episode["message_id"], protect_content=protect, reply_markup=nav_markup)
+            sent = await bot.copy_message(chat_id=call.from_user.id, from_chat_id=episode["chat_id"], message_id=episode["message_id"], protect_content=protect, reply_markup=nav_markup)
+            track_media_msg(call.from_user.id, getattr(sent, "message_id", None))
         else:
             await call.answer("⚠️ Qism ma'lumoti noto'g'ri saqlangan.", show_alert=True)
             return
@@ -1922,7 +2005,7 @@ async def category_list_callback(call: CallbackQuery):
 @dp.callback_query(F.data == "movie_list")
 async def movie_list(call: CallbackQuery):
     data = load_data()
-    if not await check_subscription(call.from_user.id):
+    if not await enforce_subscription(call.from_user.id):
         await call.message.answer("🔒 Avval majburiy kanallarga obuna bo‘ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
         return await call.answer()
     items = [(code, item) for code, item in data.get("medias", {}).items() if item.get("media_type") == "movie" and media_available_for_user(call.from_user.id, item, data)]
@@ -1939,7 +2022,7 @@ async def series_list(call: CallbackQuery):
 
 async def media_category_list(call: CallbackQuery, media_type: str, title: str, empty_text: str, page: int = 0):
     data = load_data()
-    if not await check_subscription(call.from_user.id):
+    if not await enforce_subscription(call.from_user.id):
         await call.message.answer("🔒 Avval majburiy kanallarga obuna bo‘ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
         return await call.answer()
     items = [(str(code), item) for code, item in data.get("medias", {}).items()
@@ -2043,7 +2126,7 @@ async def show_media(call: CallbackQuery):
         return await call.answer("❌ Kontent topilmadi", show_alert=True)
     if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
         return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
-    if not await check_subscription(call.from_user.id):
+    if not await enforce_subscription(call.from_user.id):
         await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
         return await call.answer()
     try:
@@ -3232,7 +3315,7 @@ async def remember_channel_join_request(event):
 @dp.callback_query(F.data == "check_sub")
 async def check_sub_callback(call: CallbackQuery):
     data = load_data()
-    if await check_subscription(call.from_user.id):
+    if await enforce_subscription(call.from_user.id):
         await send_start(call.message, call.from_user.id)
         await call.answer("✅ Obuna tasdiqlandi")
     else:
@@ -3376,6 +3459,7 @@ async def main():
     save_data(data)
     runner = await start_web_server()
     vip_monitor_task = asyncio.create_task(vip_expiry_monitor())
+    media_monitor_task = asyncio.create_task(media_monitor())
     try:
         from aiogram.types import BotCommandScopeChat
         await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash")])
@@ -3387,7 +3471,10 @@ async def main():
         await dp.start_polling(bot)
     finally:
         vip_monitor_task.cancel()
+        media_monitor_task.cancel()
         try: await vip_monitor_task
+        except asyncio.CancelledError: pass
+        try: await media_monitor_task
         except asyncio.CancelledError: pass
         await runner.cleanup()
         await bot.session.close()
