@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 import hashlib
 import difflib
 import time
@@ -10,6 +11,7 @@ import zipfile
 import io
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from html import escape as _esc
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
@@ -612,6 +614,10 @@ class Form(StatesGroup):
     manage_vip_days = State()
     manage_balance_amount = State()
     manage_mute_duration = State()
+    manage_vip_amount = State()
+    manage_tx_desc = State()
+    manage_tx_media = State()
+    manage_tx_confirm = State()
 
 
 def parse_channel_entry(entry):
@@ -1195,6 +1201,99 @@ async def user_ban_callback(call: CallbackQuery):
 
 
 
+# ---- Qo'lda pul o'tkazish / VIP berish ----
+
+TX_MEDIA_LABELS = {"photo": "🖼 Rasm", "video": "🎬 Video", "sticker": "🎨 Stiker",
+                   "document": "📄 Fayl", "animation": "🎞 GIF"}
+
+
+def _tx_money(value) -> str:
+    return f"{float(value or 0):,.0f}".replace(",", " ")
+
+
+def _tx_media_label(tx: dict) -> str:
+    return TX_MEDIA_LABELS.get(str(tx.get("media_type") or ""), "yo‘q")
+
+
+def _tx_user_text(tx: dict, balance: float, vip_until: int = 0) -> str:
+    kind = tx.get("kind")
+    lines = []
+    if kind == "vip":
+        days = int(tx.get("days") or 0)
+        lines += ["💎 <b>VIP obunangiz faollashtirildi!</b>", ""]
+        lines.append("📅 Muddat: <b>cheksiz</b>" if days == 0 else f"📅 Muddat: <b>{days} kun</b>")
+        if vip_until:
+            lines.append(f"⏳ Tugash vaqti: <b>{fmt_date(vip_until)}</b>")
+        amount = float(tx.get("amount") or 0)
+        if amount > 0:
+            lines.append(f"💰 To‘lov: <b>{_tx_money(amount)} so‘m</b> — balansingizga qo‘shildi")
+    elif kind == "out":
+        lines += ["💰 <b>Balansingizdan pul yechildi</b>", "",
+                  f"➖ Yechildi: <b>{_tx_money(tx.get('charged'))} so‘m</b>"]
+    else:
+        lines += ["💰 <b>Balansingiz to‘ldirildi</b>", "",
+                  f"➕ Qo‘shildi: <b>{_tx_money(tx.get('amount'))} so‘m</b>"]
+    lines.append(f"💳 Balansingiz: <b>{_tx_money(balance)} so‘m</b>")
+    if tx.get("desc"):
+        lines += ["", f"📝 Izoh: {_esc(str(tx['desc']))}"]
+    lines += ["", f"🕒 {datetime.now().strftime('%d.%m.%Y %H:%M')}"]
+    return "\n".join(lines)
+
+
+def _tx_confirm_text(tx: dict) -> str:
+    user = load_data().get("users", {}).get(str(tx["uid"]), {})
+    balance = float(user.get("balance", 0) or 0)
+    name = user.get("first_name") or user.get("username") or "-"
+    lines = ["🧾 <b>Amalni tasdiqlang</b>", "",
+             f"👤 Foydalanuvchi: <b>{_esc(str(name))}</b>",
+             f"🆔 ID: <code>{tx['uid']}</code>"]
+    if tx.get("kind") == "vip":
+        days = int(tx.get("days") or 0)
+        lines.append("💎 VIP: <b>cheksiz</b>" if days == 0 else f"💎 VIP: <b>{days} kun</b>")
+    if float(tx.get("amount") or 0) > 0:
+        shown = min(float(tx["amount"]), balance) if tx.get("kind") == "out" else float(tx["amount"])
+        verb = "Balansdan yechiladi" if tx.get("kind") == "out" else "Balansga qo‘shiladi"
+        lines.append(f"💰 {verb}: <b>{_tx_money(shown)} so‘m</b>")
+    else:
+        lines.append("💰 Summa: <b>yo‘q</b>")
+    if tx.get("kind") in {"add", "out"}:
+        lines.append(f"💳 Hozirgi balans: <b>{_tx_money(balance)} so‘m</b>")
+    lines.append(f"🖼 Ilova: <b>{_tx_media_label(tx)}</b>")
+    if tx.get("desc"):
+        lines += ["", f"📝 Izoh: {_esc(str(tx['desc']))}"]
+    lines += ["", "Foydalanuvchiga xabar yuboriladi."]
+    return "\n".join(lines)
+
+
+def _tx_confirm_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="txok"),
+         InlineKeyboardButton(text="❌ Bekor qilish", callback_data="txcancel")],
+    ])
+
+
+async def _tx_send_to_user(tx: dict, text: str) -> bool:
+    uid = int(tx["uid"])
+    media_type = str(tx.get("media_type") or "")
+    chat_id = tx.get("media_chat_id")
+    msg_id = tx.get("media_message_id")
+    kb = main_menu(uid)
+    if media_type and chat_id and msg_id:
+        if media_type != "sticker" and len(text) <= 1000:
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=msg_id,
+                                       caption=small_caps_html(text), reply_markup=kb)
+                return True
+            except Exception:
+                logging.exception("Qo'lda to'lov: media caption bilan yuborilmadi")
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            logging.exception("Qo'lda to'lov: ilova yuborilmadi")
+    await bot.send_message(uid, text, reply_markup=kb)
+    return True
+
+
 @dp.callback_query(F.data.startswith("uservip:"))
 async def user_vip_start(call: CallbackQuery, state: FSMContext):
     if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
@@ -1205,12 +1304,41 @@ async def user_vip_start(call: CallbackQuery, state: FSMContext):
 @dp.message(Form.manage_vip_days)
 async def user_vip_save(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id): return await state.clear()
-    try: days=int((message.text or "").strip()); assert days >= 0
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    try: days=int(text); assert days >= 0
     except Exception: return await message.answer("💎 0 yoki musbat kun sonini yuboring:")
-    ctx=await state.get_data(); uid=int(ctx["manage_uid"]); data=load_data(); user=data.get("users",{}).get(str(uid))
-    if not user: await state.clear(); return await message.answer("❌ Foydalanuvchi topilmadi.")
-    user["vip_until"] = 0 if days == 0 else now_ts()+days*86400
-    save_data(data); await state.clear(); await message.answer("✅ VIP yangilandi."); await show_user_management(message,uid)
+    ctx=await state.get_data(); uid=int(ctx["manage_uid"])
+    if not load_data().get("users",{}).get(str(uid)):
+        await state.clear(); return await message.answer("❌ Foydalanuvchi topilmadi.")
+    await state.update_data(tx={"kind": "vip", "uid": uid, "days": days, "amount": 0, "desc": ""})
+    await state.set_state(Form.manage_vip_amount)
+    await message.answer(
+        "💰 VIP uchun to‘lov summasini so‘mda yuboring (masalan, 50000).\n"
+        "Summa foydalanuvchi balansiga ham qo‘shiladi.\n\n"
+        "Kerak bo‘lmasa: /skipp\nBekor qilish: /cancel")
+
+@dp.message(Form.manage_vip_amount)
+async def user_vip_amount_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    if text.lower() in {"/skipp", "/skip"}:
+        amount = 0.0
+    else:
+        try: amount=float(text.replace(" ", "").replace(",", ".")); assert amount >= 0
+        except Exception: return await message.answer("💰 Summani raqamda yuboring (masalan, 50000) yoki /skipp bosing:")
+    ctx=await state.get_data(); tx=ctx.get("tx") or {}
+    tx["amount"]=amount
+    await state.update_data(tx=tx)
+    await state.set_state(Form.manage_tx_desc)
+    await message.answer(
+        "📝 Izoh (tavsif) yozing — foydalanuvchi xabarida ko‘rinadi.\n\n"
+        "Kerak bo‘lmasa: /skipp\nBekor qilish: /cancel")
 
 @dp.callback_query(F.data.startswith("uservipremove:"))
 async def user_vip_remove(call: CallbackQuery):
@@ -1227,12 +1355,120 @@ async def user_balance_start(call: CallbackQuery, state: FSMContext):
 @dp.message(Form.manage_balance_amount)
 async def user_balance_save(message: Message, state: FSMContext):
     if not is_owner(message.from_user.id): return await state.clear()
-    try: amount=float((message.text or "").strip().replace(",",".")); assert amount > 0
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    try: amount=float(text.replace(" ", "").replace(",",".")); assert amount > 0
     except Exception: return await message.answer("💰 Musbat summa kiriting:")
-    ctx=await state.get_data(); uid=int(ctx["manage_uid"]); data=load_data(); user=data.get("users",{}).get(str(uid))
-    if not user: await state.clear(); return await message.answer("❌ Foydalanuvchi topilmadi.")
-    old=float(user.get("balance",0) or 0); user["balance"] = old + amount if ctx["balance_mode"]=="userbalance" else max(0,old-amount)
-    save_data(data); await state.clear(); await message.answer("✅ Balans yangilandi."); await show_user_management(message,uid)
+    ctx=await state.get_data(); uid=int(ctx["manage_uid"])
+    if not load_data().get("users",{}).get(str(uid)):
+        await state.clear(); return await message.answer("❌ Foydalanuvchi topilmadi.")
+    kind = "add" if ctx.get("balance_mode") == "userbalance" else "out"
+    await state.update_data(tx={"kind": kind, "uid": uid, "amount": amount, "desc": ""})
+    await state.set_state(Form.manage_tx_desc)
+    await message.answer(
+        "📝 Izoh (tavsif) yozing — foydalanuvchi xabarida ko‘rinadi.\n\n"
+        "Kerak bo‘lmasa: /skipp\nBekor qilish: /cancel")
+
+@dp.message(Form.manage_tx_desc)
+async def manage_tx_desc_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    has_media = bool(message.photo or message.video or message.document
+                     or message.sticker or message.animation)
+    if has_media:
+        return await message.answer("📝 Avval izohni yozing yoki /skipp bosing — ilovani keyingi qadamda yuborasiz.")
+    desc = "" if text.lower() in {"/skipp", "/skip"} else text[:900]
+    ctx=await state.get_data(); tx=ctx.get("tx") or {}
+    tx["desc"]=desc
+    await state.update_data(tx=tx)
+    await state.set_state(Form.manage_tx_media)
+    await message.answer(
+        "🖼 Rasm, video, fayl (txt) yoki stiker yuboring — u foydalanuvchiga shu xabar bilan boradi.\n\n"
+        "Kerak bo‘lmasa: /skipp\nBekor qilish: /cancel")
+
+@dp.message(Form.manage_tx_media)
+async def manage_tx_media_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    ctx=await state.get_data(); tx=ctx.get("tx") or {}
+    if text.lower() in {"/skipp", "/skip"}:
+        tx.pop("media_type", None); tx.pop("media_chat_id", None); tx.pop("media_message_id", None)
+    else:
+        media_type = ("photo" if message.photo else "video" if message.video
+                      else "sticker" if message.sticker else "document" if message.document
+                      else "animation" if message.animation else "")
+        if not media_type:
+            return await message.answer("🖼 Rasm, video, fayl yoki stiker yuboring. Kerak bo‘lmasa: /skipp")
+        tx["media_type"]=media_type
+        tx["media_chat_id"]=message.chat.id
+        tx["media_message_id"]=message.message_id
+    await state.update_data(tx=tx)
+    await state.set_state(Form.manage_tx_confirm)
+    await message.answer(_tx_confirm_text(tx), reply_markup=_tx_confirm_kb())
+
+@dp.message(Form.manage_tx_confirm)
+async def manage_tx_confirm_wait(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id): return await state.clear()
+    if (message.text or "").strip() == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    await message.answer("🧾 Tasdiqlash uchun ✅ Tasdiqlash yoki ❌ Bekor qilish tugmasini bosing.")
+
+@dp.callback_query(F.data.in_({"txok", "txcancel"}))
+async def manage_tx_confirm(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    ctx = await state.get_data(); tx = ctx.get("tx")
+    if not tx or "uid" not in tx:
+        await state.clear()
+        return await call.answer("Bu amal allaqachon yakunlangan.", show_alert=True)
+    if call.data == "txcancel":
+        await state.clear()
+        try: await call.message.edit_text("❎ Amal bekor qilindi.")
+        except Exception: pass
+        return await call.answer("Bekor qilindi")
+    data = load_data(); user = data.get("users", {}).get(str(tx["uid"]))
+    if not user:
+        await state.clear()
+        return await call.answer("❌ Foydalanuvchi topilmadi", show_alert=True)
+    kind = tx.get("kind"); amount = float(tx.get("amount") or 0)
+    balance = float(user.get("balance", 0) or 0)
+    vip_until = 0; charged = amount
+    if kind == "add":
+        balance += amount
+    elif kind == "out":
+        charged = min(amount, balance)
+        balance = max(0, balance - amount)
+    elif kind == "vip":
+        days = int(tx.get("days") or 0)
+        vip_until = now_ts() + (days * 86400 if days > 0 else 100 * 365 * 86400)
+        user["vip_until"] = vip_until
+        user.pop("vip_warned_until", None)
+        balance += amount
+    user["balance"] = balance
+    tx["charged"] = charged
+    save_data(data)
+    delivered = True
+    try:
+        await _tx_send_to_user(tx, _tx_user_text(tx, balance, vip_until))
+    except Exception:
+        delivered = False
+        logging.exception("Qo'lda to'lov: foydalanuvchiga xabar yuborilmadi")
+    await state.clear()
+    tail = ("\n\n✅ Bajarildi, foydalanuvchiga xabar yuborildi." if delivered
+            else "\n\n⚠️ Bajarildi, lekin foydalanuvchiga xabar yetkazilmadi (botni bloklagan bo‘lishi mumkin).")
+    try: await call.message.edit_text(_tx_confirm_text(tx) + tail)
+    except Exception: pass
+    await call.answer("✅ Bajarildi." if delivered else "⚠️ Xabar yetkazilmadi", show_alert=not delivered)
+    await show_user_management(call.message, int(tx["uid"]))
 
 @dp.callback_query(F.data.startswith("usermute:"))
 async def user_mute_start(call: CallbackQuery, state: FSMContext):
@@ -2094,6 +2330,99 @@ async def episode_season_select(message: Message, state: FSMContext):
     await state.update_data(progress_message_id=prompt.message_id)
 
 
+_EP_KEYWORDS = (
+    r"qism|qismi|episode|epizod|seriya|seria|part|серия|часть",
+    r"bolum|bolumu|bolim|bolimi|chapter",
+)
+_NUM_WORDS = {
+    "nol": 0, "bir": 1, "ikki": 2, "uch": 3, "tort": 4, "besh": 5, "olti": 6,
+    "yetti": 7, "sakkiz": 8, "toqqiz": 9, "on": 10, "yigirma": 20, "ottiz": 30,
+    "qirq": 40, "ellik": 50, "oltmish": 60, "yetmish": 70, "sakson": 80,
+    "toqson": 90, "yuz": 100,
+    # turkcha
+    "iki": 2, "uc": 3, "dort": 4, "bes": 5, "alti": 6, "yedi": 7, "dokuz": 9,
+    "yirmi": 20, "otuz": 30, "kirk": 40, "elli": 50, "altmis": 60,
+    "yetmis": 70, "seksen": 80, "doksan": 90,
+}
+_ORD_WORDS = {
+    "birinchi": 1, "ikkinchi": 2, "uchinchi": 3, "tortinchi": 4, "beshinchi": 5,
+    "oltinchi": 6, "yettinchi": 7, "sakkizinchi": 8, "toqqizinchi": 9,
+    "oninchi": 10, "yigirmanchi": 20, "ottizinchi": 30, "qirqinchi": 40,
+    "elliginchi": 50, "oltmishinchi": 60, "yetmishinchi": 70,
+    "saksoninchi": 80, "toqsoninchi": 90, "yuzinchi": 100,
+    "birinci": 1, "ikinci": 2, "ucuncu": 3, "dorduncu": 4, "besinci": 5,
+    "altinci": 6, "yedinci": 7, "sekizinci": 8, "dokuzuncu": 9, "onuncu": 10,
+}
+_TRANS = {
+    ord("ö"): "o", ord("ü"): "u", ord("ş"): "s", ord("ç"): "c", ord("ğ"): "g",
+    ord("ı"): "i", ord("ə"): "e", ord("’"): "", ord("‘"): "", ord("`"): "",
+    ord("'"): "", ord("ʻ"): "", ord("ʼ"): "",
+    ord(chr(0x307)): "", ord("–"): "-", ord("—"): "-", ord("−"): "-", ord("‐"): "-", ord("‑"): "-",
+}
+for _digits in ("٠١٢٣٤٥٦٧٨٩", "۰۱۲۳۴۵۶۷۸۹"):
+    for _idx, _ch in enumerate(_digits):
+        _TRANS[ord(_ch)] = str(_idx)
+
+
+def _norm_caption(value):
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return " ".join(text.casefold().translate(_TRANS).split())
+
+
+def _num_words_sum(tokens):
+    total, found = 0, False
+    for token in tokens:
+        value = _NUM_WORDS.get(token, _ORD_WORDS.get(token))
+        if value is None:
+            return None
+        found = True
+        if value == 100:
+            total = (total or 1) * 100
+        else:
+            total += value
+    return total if found else None
+
+
+def _words_phrase_number(phrase):
+    tokens = [t for t in phrase.split() if t]
+    for start in range(len(tokens)):
+        value = _num_words_sum(tokens[start:])
+        if value:
+            return value
+    return None
+
+
+def _detect_part_number(text):
+    """Qism raqamini turli yozuvlarda topadi: '5-qism', '5. BÖLÜM', 'Qism: 5', 'beshinchi qism'."""
+    norm = _norm_caption(text)
+    if not norm:
+        return None
+    for keywords in _EP_KEYWORDS:
+        for pattern in (r"(\d{1,4})\s*[.\-–—_:#№)\]]*\s*(?:%s)" % keywords,
+                        r"(?:%s)\s*[.\-–—_:#№]*\s*(\d{1,4})" % keywords):
+            m = re.search(pattern, norm)
+            if m and int(m.group(1)) > 0:
+                return int(m.group(1))
+        for pattern in (r"([a-z]+(?:\s+[a-z]+){0,3})\s*(?:%s)" % keywords,
+                        r"(?:%s)\s*([a-z]+(?:\s+[a-z]+){0,3})" % keywords):
+            m = re.search(pattern, norm)
+            if m:
+                value = _words_phrase_number(m.group(1))
+                if value:
+                    return value
+    m = re.search(r"\bs\s*(\d{1,2})\s*[._ -]?\s*e\s*(\d{1,4})\b", norm)
+    if m:
+        return int(m.group(2))
+    m = re.search(r"\b(\d{1,2})\s*[xх]\s*(\d{1,4})\b", norm)
+    if m:
+        return int(m.group(2))
+    cleaned = re.sub(r"\d+\s*[.\-]?\s*(?:fasl|mavsum|season|sezon|saison|сезон)", " ", norm)
+    cleaned = re.sub(r"\b(?:19|20)\d{2}\b", " ", cleaned)
+    cleaned = re.sub(r"\b\d{3,4}\s*p\b", " ", cleaned)
+    m = re.search(r"\b(\d{1,3})\b", cleaned)
+    return int(m.group(1)) if m and int(m.group(1)) > 0 else None
+
+
 @dp.message(Form.episode_batch)
 async def episode_batch_message(message: Message, state: FSMContext):
     """Qism faqat bot administrator bo'lgan kanaldan forward qilinganda qabul qilinadi."""
@@ -2156,16 +2485,16 @@ async def episode_batch_message(message: Message, state: FSMContext):
     numeric = [int(n) for n in episodes if str(n).isdigit()]
     next_number = max(numeric, default=0) + 1
     caption_text = " ".join(filter(None, [message.caption or "", message.text or ""]))
-    episode_patterns = [r"(?:qism|episode|ep)\s*[:._-]?\s*(\d+)", r"(\d+)\s*[-._ ]?\s*(?:qism|episode|ep)\b"]
-    detected_number = None
-    for pattern in episode_patterns:
-        found = re.search(pattern, caption_text, flags=re.IGNORECASE)
-        if found:
-            detected_number = int(found.group(1))
-            break
+    detected_number = _detect_part_number(caption_text)
     number = detected_number if detected_number and detected_number > 0 else next_number
+    note = ""
     if str(number) in episodes:
-        return await message.answer(f"⚠️ {number}-qism avvaldan mavjud. Takroriy qism saqlanmadi. Tavsifdagi raqamni tekshiring yoki avvalgi qismni o'chiring.")
+        existing_record = episodes.get(str(number)) or {}
+        if file_id and existing_record.get("file_id") == file_id:
+            return await message.answer(f"⚠️ Bu media allaqachon {number}-qism sifatida saqlangan.")
+        taken = number
+        number = next_number
+        note = f"\nℹ️ {taken}-qism band edi — {number}-qism sifatida saqlandi."
     if origin_chat and origin_message_id:
         # Asl postni nusxalash media xabari va mavjud coverni saqlash uchun afzal.
         record = {"chat_id": origin_chat.id, "message_id": origin_message_id, "media_type": media_type or "video"}
@@ -2190,11 +2519,11 @@ async def episode_batch_message(message: Message, state: FSMContext):
     if progress_id:
         try:
             await bot.edit_message_text(chat_id=message.chat.id, message_id=progress_id,
-                text=f"🎬 <b>{item['name']}</b> · {season_no}-fasl\n✅ {count} ta media qabul qilindi. Oxirgisi: <b>{number}-qism</b>.\n\nPostlarni yuborishda davom eting.\nTugatish: /done · Bekor qilish: /cancel")
+                text=f"🎬 <b>{item['name']}</b> · {season_no}-fasl\n✅ {count} ta media qabul qilindi. Oxirgisi: <b>{number}-qism</b>.{note}\n\nPostlarni yuborishda davom eting.\nTugatish: /done · Bekor qilish: /cancel")
         except Exception:
-            await message.answer(f"✅ {number}-qism saqlandi. Keyingi postni forward qiling yoki /done yozing.")
+            await message.answer(f"✅ {number}-qism saqlandi.{note}\nKeyingi postni forward qiling yoki /done yozing.")
     else:
-        await message.answer(f"✅ {number}-qism saqlandi. Keyingi postni forward qiling yoki /done yozing.")
+        await message.answer(f"✅ {number}-qism saqlandi.{note}\nKeyingi postni forward qiling yoki /done yozing.")
 
 @dp.callback_query(F.data == "edit_poster")
 async def edit_poster_start(call: CallbackQuery, state: FSMContext):
