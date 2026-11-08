@@ -201,6 +201,10 @@ def default_data():
         "channel_catalog": {},
         "users": {},
         "banned_users": [],
+        "orders": [],
+        "complaints": [],
+        "order_seq": 0,
+        "complaint_seq": 0,
         "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "maintenance": False, "vip_enabled": False, "vip_save_protection": True, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
     }
 
@@ -376,6 +380,7 @@ def main_menu(user_id=None):
         [InlineKeyboardButton(text="👤 Hisobim", callback_data="account"), InlineKeyboardButton(text="👥 Referal", callback_data="referral")],
         [InlineKeyboardButton(text="💰 Balans", callback_data="account"), InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
         [InlineKeyboardButton(text="❓ VIP o‘zi nima?", callback_data="vip_info")],
+        [InlineKeyboardButton(text="🛒 Buyurtma berish", callback_data="order_new"), InlineKeyboardButton(text="📝 Shikoyat", callback_data="complaint_new")],
         [InlineKeyboardButton(text="📖 Qo‘llanma", callback_data="guide")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -434,6 +439,7 @@ def owner_menu():
         [InlineKeyboardButton(text=("💎 VIP: O'CHIRISH" if load_data().get("settings", {}).get("vip_enabled", False) else "💎 VIP: YOQISH"), callback_data="owner_vip")],
         [InlineKeyboardButton(text=("🔐 Saqlash himoyasi: YOQILGAN" if load_data().get("settings", {}).get("vip_save_protection", True) else "🔓 Saqlash himoyasi: O'CHIRILGAN"), callback_data="owner_save_protection")],
         [InlineKeyboardButton(text="📣 Hammaga xabar yuborish", callback_data="broadcast")],
+        [InlineKeyboardButton(text="🛒 Buyurtmalar", callback_data="owner_orders"), InlineKeyboardButton(text="📝 Shikoyatlar", callback_data="owner_complaints")],
         [InlineKeyboardButton(text="⚙️ Bot sozlamalari", callback_data="owner_settings")],
         [InlineKeyboardButton(text="👥 Obunachilarni boshqarish", callback_data="manage_users")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
@@ -618,6 +624,9 @@ class Form(StatesGroup):
     manage_tx_desc = State()
     manage_tx_media = State()
     manage_tx_confirm = State()
+    request_text = State()
+    request_confirm = State()
+    request_reply = State()
 
 
 def parse_channel_entry(entry):
@@ -3320,6 +3329,266 @@ async def check_sub_callback(call: CallbackQuery):
         await call.answer("✅ Obuna tasdiqlandi")
     else:
         await call.answer("⚠️ Hamma kanallarga obuna bo'ling yoki 💎 VIP oling.", show_alert=True)
+
+
+# ================= BUYURTMA VA SHIKOYAT =================
+
+REQUEST_META = {
+    "order": {
+        "emoji": "🛒", "noun": "buyurtma", "plural": "Buyurtmalar",
+        "store": "orders", "seq": "order_seq", "reply_title": "Buyurtmangizga javob",
+        "prompt": "🛒 <b>Buyurtma berish</b>\n\nQaysi kino, serial yoki animeni qo'shishimizni xohlaysiz? Nomini va istaklaringizni yozing.\nBekor qilish: /cancel",
+        "received": "✅ Buyurtmangiz qabul qilindi. Tez orada ko'rib chiqamiz.",
+    },
+    "complaint": {
+        "emoji": "📝", "noun": "shikoyat", "plural": "Shikoyatlar",
+        "store": "complaints", "seq": "complaint_seq", "reply_title": "Shikoyatingizga javob",
+        "prompt": "📝 <b>Shikoyat</b>\n\nShikoyatingizni batafsil yozing (muammo, xatolik yoki taklif).\nBekor qilish: /cancel",
+        "received": "✅ Shikoyatingiz qabul qilindi. Ko'rib chiqamiz.",
+    },
+}
+
+
+def _request_recipients(data):
+    ids = {OWNER_ID}
+    ids.update(ADMIN_IDS)
+    ids.update(x for x in data.get("admins", []) if isinstance(x, int))
+    return {i for i in ids if i}
+
+
+async def _request_start(call: CallbackQuery, state: FSMContext, kind: str):
+    await state.clear()
+    await state.update_data(request_kind=kind)
+    await state.set_state(Form.request_text)
+    await call.message.answer(REQUEST_META[kind]["prompt"])
+    await call.answer()
+
+
+@dp.callback_query(F.data == "order_new")
+async def order_new_callback(call: CallbackQuery, state: FSMContext):
+    await _request_start(call, state, "order")
+
+
+@dp.callback_query(F.data == "complaint_new")
+async def complaint_new_callback(call: CallbackQuery, state: FSMContext):
+    await _request_start(call, state, "complaint")
+
+
+@dp.message(Form.request_text)
+async def request_text_save(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=main_menu(message.from_user.id))
+    if not text:
+        return await message.answer("✍️ Iltimos, matn yuboring. Bekor qilish: /cancel")
+    if len(text) < 3:
+        return await message.answer("✍️ Juda qisqa. Batafsilroq yozing:")
+    ctx = await state.get_data()
+    meta = REQUEST_META[ctx.get("request_kind", "order")]
+    text = text[:1500]
+    await state.update_data(request_text=text)
+    await state.set_state(Form.request_confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yuborish", callback_data="req_send"),
+         InlineKeyboardButton(text="❌ Bekor qilish", callback_data="req_cancel")],
+    ])
+    await message.answer(f"{meta['emoji']} <b>Tasdiqlang</b>\n\n{_esc(text)}\n\nYuborishni tasdiqlaysizmi?", reply_markup=kb)
+
+
+@dp.message(Form.request_confirm)
+async def request_confirm_wait(message: Message, state: FSMContext):
+    if (message.text or "").strip() == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=main_menu(message.from_user.id))
+    await message.answer("👆 «✅ Yuborish» yoki «❌ Bekor qilish» tugmasini bosing.")
+
+
+@dp.callback_query(F.data == "req_cancel")
+async def request_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await call.message.edit_text("❎ Bekor qilindi.")
+    except Exception:
+        pass
+    await call.answer()
+
+
+@dp.callback_query(F.data == "req_send")
+async def request_send(call: CallbackQuery, state: FSMContext):
+    ctx = await state.get_data()
+    kind = ctx.get("request_kind", "order")
+    text = (ctx.get("request_text") or "").strip()
+    meta = REQUEST_META[kind]
+    if not text:
+        await state.clear()
+        return await call.answer("Matn topilmadi. Qaytadan boshlang.", show_alert=True)
+    data = load_data()
+    data[meta["seq"]] = int(data.get(meta["seq"], 0) or 0) + 1
+    rid = data[meta["seq"]]
+    data.setdefault(meta["store"], []).append({
+        "id": rid, "uid": call.from_user.id, "name": call.from_user.full_name,
+        "username": call.from_user.username or "", "text": text,
+        "at": now_ts(), "status": "new",
+    })
+    save_data(data)
+    await state.clear()
+    try:
+        await call.message.edit_text(f"{meta['received']}\n\n🔖 Raqam: <b>#{rid}</b>")
+    except Exception:
+        await call.message.answer(f"{meta['received']} (#{rid})")
+    await call.answer("✅ Yuborildi")
+    username = f"@{call.from_user.username}" if call.from_user.username else "username yo'q"
+    note = (f"{meta['emoji']} <b>Yangi {meta['noun']}</b> #{rid}\n"
+            f"👤 {_esc(call.from_user.full_name)}\n🔗 {username}\n"
+            f"🆔 <code>{call.from_user.id}</code>\n🕒 {fmt_date(now_ts())}\n\n💬 {_esc(text)}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Javob berish", callback_data=f"reqreply:{kind}:{rid}")],
+    ])
+    for admin_id in _request_recipients(data):
+        try:
+            await bot.send_message(admin_id, note, reply_markup=kb)
+        except Exception as exc:
+            logging.info("Murojaat xabari %s ga yuborilmadi: %s", admin_id, exc)
+
+
+def _requests_back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")],
+    ])
+
+
+async def _show_requests(call: CallbackQuery, kind: str):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    meta = REQUEST_META[kind]
+    data = load_data()
+    items = list(data.get(meta["store"], []))
+    if not items:
+        text = f"{meta['emoji']} <b>{meta['plural']}</b>\n\nHozircha murojaatlar yo'q."
+        try:
+            await call.message.edit_text(text, reply_markup=_requests_back_kb())
+        except Exception:
+            await call.message.answer(text, reply_markup=_requests_back_kb())
+        return await call.answer()
+    new_count = sum(1 for r in items if r.get("status") == "new")
+    blocks, rows = [], []
+    for r in reversed(items[-12:]):
+        status = {"new": "🆕 yangi", "answered": "✍️ javob berilgan", "done": "✅ bajarilgan"}.get(r.get("status"), str(r.get("status")))
+        uname = f"@{r['username']}" if r.get("username") else (r.get("name") or "?")
+        blocks.append(f"#{r['id']} • {status}\n👤 {_esc(str(uname))} • 🆔 <code>{r['uid']}</code>\n💬 {_esc(str(r.get('text', '')))[:220]}")
+        row = [InlineKeyboardButton(text=f"✍️ #{r['id']}", callback_data=f"reqreply:{kind}:{r['id']}")]
+        if r.get("status") != "done":
+            row.append(InlineKeyboardButton(text=f"✅ #{r['id']}", callback_data=f"reqdone:{kind}:{r['id']}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="🗑 Tozalash", callback_data=f"reqclear:{kind}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")])
+    text = f"{meta['emoji']} <b>{meta['plural']}</b> (yangi: {new_count})\n\n" + "\n\n".join(blocks)
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "owner_orders")
+async def owner_orders_callback(call: CallbackQuery):
+    await _show_requests(call, "order")
+
+
+@dp.callback_query(F.data == "owner_complaints")
+async def owner_complaints_callback(call: CallbackQuery):
+    await _show_requests(call, "complaint")
+
+
+@dp.callback_query(F.data.startswith("reqreply:"))
+async def request_reply_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    try:
+        _, kind, rid = call.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        return await call.answer("⚠️ Xato tugma", show_alert=True)
+    if kind not in REQUEST_META:
+        return await call.answer("⚠️ Noma'lum tur", show_alert=True)
+    await state.update_data(reply_kind=kind, reply_id=rid)
+    await state.set_state(Form.request_reply)
+    await call.message.answer(f"✍️ #{rid} {REQUEST_META[kind]['noun']}ga javob matnini yozing.\nBekor qilish: /cancel")
+    await call.answer()
+
+
+@dp.message(Form.request_reply)
+async def request_reply_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Faqat owner uchun.")
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=owner_menu())
+    if not text:
+        return await message.answer("✍️ Javob matnini yuboring. Bekor qilish: /cancel")
+    ctx = await state.get_data()
+    kind = ctx.get("reply_kind")
+    rid = int(ctx.get("reply_id", 0))
+    meta = REQUEST_META.get(kind)
+    data = load_data()
+    record = next((r for r in data.get(meta["store"], []) if r.get("id") == rid), None) if meta else None
+    if not record:
+        await state.clear()
+        return await message.answer("❌ Murojaat topilmadi.", reply_markup=owner_menu())
+    uid = int(record["uid"])
+    reply_text = f"{meta['emoji']} <b>{meta['reply_title']}</b> (#{rid})\n\n{_esc(text[:1500])}"
+    delivered = True
+    try:
+        await bot.send_message(uid, reply_text, reply_markup=main_menu(uid))
+    except Exception:
+        delivered = False
+    record["status"] = "answered"
+    record["reply"] = text[:1500]
+    record["replied_at"] = now_ts()
+    save_data(data)
+    await state.clear()
+    tail = "✅ Javob yuborildi." if delivered else "⚠️ Javob saqlandi, lekin foydalanuvchiga yetkazilmadi (botni bloklagan bo'lishi mumkin)."
+    await message.answer(tail, reply_markup=owner_menu())
+
+
+@dp.callback_query(F.data.startswith("reqdone:"))
+async def request_done(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    try:
+        _, kind, rid = call.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        return await call.answer("⚠️ Xato tugma", show_alert=True)
+    meta = REQUEST_META.get(kind)
+    if not meta:
+        return await call.answer("⚠️ Noma'lum tur", show_alert=True)
+    data = load_data()
+    record = next((r for r in data.get(meta["store"], []) if r.get("id") == rid), None)
+    if record:
+        record["status"] = "done"
+        save_data(data)
+    await call.answer(f"✅ #{rid} bajarildi")
+    await _show_requests(call, kind)
+
+
+@dp.callback_query(F.data.startswith("reqclear:"))
+async def request_clear(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    kind = call.data.split(":")[1]
+    meta = REQUEST_META.get(kind)
+    if not meta:
+        return await call.answer("⚠️ Noma'lum tur", show_alert=True)
+    data = load_data()
+    data[meta["store"]] = [r for r in data.get(meta["store"], []) if r.get("status") == "new"]
+    save_data(data)
+    await call.answer("🗑 Tozalandi")
+    await _show_requests(call, kind)
 
 
 @dp.message(Command("cancel"))
