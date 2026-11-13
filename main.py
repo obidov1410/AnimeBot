@@ -23,6 +23,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 
 
 # Tugma yozuvlari uchun foydalanuvchi tanlagan small-caps uslubi.
@@ -34,11 +35,58 @@ _SMALL_CAPS = str.maketrans({
 })
 def small_caps(value):
     return str(value).translate(_SMALL_CAPS)
+
+# Premium (custom) emoji ID larni Telegram faqat Fragment'da username sotib olgan
+# botlarda qabul qiladi. Bir marta aniqlangach holat butun jarayonga qo'llanadi.
+_CUSTOM_EMOJI_STATE = {"allowed": True}
+
+
+def _button_emoji_value(callback_data):
+    """Owner panelida tugmaga biriktirilgan premium emoji ID yoki oddiy emoji."""
+    try:
+        saved = load_data().get("settings", {}).get("button_emojis", {})
+        return str(saved.get(str(callback_data)) or "").strip()
+    except Exception:
+        return ""
+
+
+def _apply_button_emoji(button, value):
+    if not value or not _CUSTOM_EMOJI_STATE["allowed"]:
+        return button
+    if value.isdigit():
+        # icon_custom_emoji_id premium emojini tugma oldiga qo'yadi.
+        try:
+            button.icon_custom_emoji_id = value
+        except Exception:
+            pass
+        return button
+    if value not in button.text:
+        button.text = (value + " " + button.text).strip()
+    return button
+
+
+def _strip_custom_emoji_icons(markup):
+    """Telegram premium emojini rad etsa, tugmalardan ikonkani olib tashlaydi."""
+    try:
+        for row in markup.inline_keyboard:
+            for button in row:
+                if getattr(button, "icon_custom_emoji_id", None):
+                    button.icon_custom_emoji_id = None
+    except Exception:
+        pass
+    return markup
+
+
+def _is_custom_emoji_error(exc):
+    text = str(exc).lower()
+    return "emoji" in text or "button_icon" in text
+
+
 def InlineKeyboardButton(*, text, **kwargs):
     """Tugma sozlamalarini har tugmada diskdan o'qimasdan, xotiradagi ma'lumotdan oladi."""
+    _cb = str(kwargs.get("callback_data", ""))
     try:
         _cfg = load_data().get("settings", {})
-        _cb = str(kwargs.get("callback_data", ""))
         _custom_text = _cfg.get("button_texts", {}).get(_cb)
         if _custom_text:
             text = _custom_text
@@ -56,7 +104,8 @@ def InlineKeyboardButton(*, text, **kwargs):
             kwargs.pop("style", None)
     except Exception:
         pass
-    return TelegramInlineKeyboardButton(text=small_caps(text), **kwargs)
+    button = TelegramInlineKeyboardButton(text=small_caps(text), **kwargs)
+    return _apply_button_emoji(button, _button_emoji_value(_cb))
 
 def _button_color_group(callback_data, text=""):
     cb = str(callback_data or "")
@@ -151,21 +200,32 @@ def small_caps_html(value):
     return "".join(output)
 
 class StyledBot(Bot):
+    async def _call_with_emoji_fallback(self, method, *args, **kwargs):
+        try:
+            return await method(*args, **kwargs)
+        except TelegramBadRequest as exc:
+            if _CUSTOM_EMOJI_STATE["allowed"] and _is_custom_emoji_error(exc):
+                _CUSTOM_EMOJI_STATE["allowed"] = False
+                logging.warning("Premium emoji tugmalarda ishlamadi, emojisiz qayta yuborilmoqda: %s", exc)
+                _strip_custom_emoji_icons(kwargs.get("reply_markup"))
+                return await method(*args, **kwargs)
+            raise
+
     async def send_message(self, chat_id, text, *args, **kwargs):
-        return await super().send_message(chat_id, small_caps_html(text), *args, **kwargs)
+        return await self._call_with_emoji_fallback(super().send_message, chat_id, small_caps_html(text), *args, **kwargs)
 
     async def send_photo(self, chat_id, photo, *args, **kwargs):
         if kwargs.get("caption") is not None:
             kwargs["caption"] = small_caps_html(kwargs["caption"])
-        return await super().send_photo(chat_id, photo, *args, **kwargs)
+        return await self._call_with_emoji_fallback(super().send_photo, chat_id, photo, *args, **kwargs)
 
     async def edit_message_text(self, text, *args, **kwargs):
-        return await super().edit_message_text(small_caps_html(text), *args, **kwargs)
+        return await self._call_with_emoji_fallback(super().edit_message_text, small_caps_html(text), *args, **kwargs)
 
     async def edit_message_caption(self, *args, **kwargs):
         if kwargs.get("caption") is not None:
             kwargs["caption"] = small_caps_html(kwargs["caption"])
-        return await super().edit_message_caption(*args, **kwargs)
+        return await self._call_with_emoji_fallback(super().edit_message_caption, *args, **kwargs)
 
 bot = StyledBot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -205,7 +265,7 @@ def default_data():
         "complaints": [],
         "order_seq": 0,
         "complaint_seq": 0,
-        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "maintenance": False, "vip_enabled": False, "vip_save_protection": True, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
+        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "button_emojis": {}, "maintenance": False, "vip_enabled": False, "vip_save_protection": True, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
     }
 
 
@@ -433,6 +493,7 @@ def owner_menu():
         [InlineKeyboardButton(text="🔐 Admin huquqlarini sozlash", callback_data="admin_permissions")],
         [InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="add_channel"), InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="del_channel")],
         [InlineKeyboardButton(text="🎨 Tugma ranglari", callback_data="appearance")],
+        [InlineKeyboardButton(text="😀 Tugmalarga emoji qo'shish", callback_data="button_emoji_menu")],
         [InlineKeyboardButton(text="💾 Zaxira olish", callback_data="owner_backup"), InlineKeyboardButton(text="♻️ Zaxirani tiklash", callback_data="owner_restore_help")],
         [InlineKeyboardButton(text="🗄 Zaxira kanalini o'zgartirish", callback_data="backup_channel_change")],
         [InlineKeyboardButton(text="🛠 Texnik tanaffus: holat", callback_data="owner_maintenance")],
@@ -614,6 +675,7 @@ class Form(StatesGroup):
     owner_backup_channel = State()
     broadcast_message = State()
     button_text_value = State()
+    button_emoji_value = State()
     edit_poster_code = State()
     edit_poster_file = State()
     admin_permissions_id = State()
@@ -3094,7 +3156,7 @@ async def appearance_menu(call: CallbackQuery):
         return await call.answer("⛔ Faqat admin va owner uchun", show_alert=True)
     data = load_data()
     colors = data.get("settings", {}).get("button_colors", {})
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text=f"🔎 Qidirish tugmalari: {colors.get('search', 'standart')}", callback_data="color_group:search")],
         [InlineKeyboardButton(text=f"🎬 Kontent tugmalari: {colors.get('content', 'standart')}", callback_data="color_group:content")],
         [InlineKeyboardButton(text=f"⏭ Keyingi qism tugmasi: {colors.get('next_episode', 'standart')}", callback_data="color_group:next_episode")],
@@ -3106,8 +3168,11 @@ async def appearance_menu(call: CallbackQuery):
         [InlineKeyboardButton(text="🌈 Barcha tugmalar", callback_data="color_group:all")],
         [InlineKeyboardButton(text="♻️ Ranglarni tozalash", callback_data="color_reset")],
         [InlineKeyboardButton(text="✏️ Tugma nomlarini o‘zgartirish", callback_data="button_text_menu")],
-        [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
-    ])
+    ]
+    if is_owner(call.from_user.id):
+        rows.append([InlineKeyboardButton(text="😀 Tugmalarga emoji qo‘shish", callback_data="button_emoji_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await call.message.answer("🎨 <b>Chiroyli ko‘rinish</b>\nTugma guruhini tanlang, keyin rangini belgilang. Telegram inline tugmalarda faqat standart, ko‘k (primary), yashil (success) va qizil (danger) uslublarni beradi; boshqa rangni kod bilan majburlab bo‘lmaydi.", reply_markup=kb)
     await call.answer()
 
@@ -3181,6 +3246,246 @@ EDITABLE_BUTTONS = {
     "broadcast": "📣 Hammaga xabar yuborish",
 }
 
+# Owner panelidagi "Tugmalarga emoji" bo'limi shu ro'yxatlar asosida ishlaydi.
+# Kalit — tugmaning callback_data si, shu orqali emoji aniq tugmaga bog'lanadi.
+BUTTON_EMOJI_GROUPS = [
+    ("main", "🏠 Asosiy menyu", [
+        ("search_menu", "🔎 Anime va Kino izlash"),
+        ("account", "👤 Hisobim"),
+        ("referral", "👥 Referal"),
+        ("vip_buy", "💎 VIP olish"),
+        ("vip_info", "❓ VIP o'zi nima?"),
+        ("order_new", "🛒 Buyurtma berish"),
+        ("complaint_new", "📝 Shikoyat"),
+        ("guide", "📖 Qo'llanma"),
+        ("home", "⬅️ Orqaga / asosiy menyu"),
+    ]),
+    ("search", "🔎 Qidiruv menyusi", [
+        ("search", "🔢 Kod bo'yicha izlash"),
+        ("search_name", "🔠 Nom bo'yicha izlash"),
+        ("category_list:movie", "🎞 Kinolar ro'yxati"),
+        ("category_list:series", "📺 Seriallar ro'yxati"),
+        ("category_list:anime", "🍥 Anime ro'yxati"),
+        ("category_list:cartoon", "🎨 Multfilmlar ro'yxati"),
+        ("check_sub", "✅ Obunani tekshirish"),
+    ]),
+    ("admin", "🛠 Admin / Owner paneli", [
+        ("add_movie", "➕ Kino qo'shish"),
+        ("add_series", "➕ Serial qo'shish"),
+        ("newtype:anime", "🍥 Anime qo'shish"),
+        ("newtype:cartoon", "🎨 Multfilm qo'shish"),
+        ("add_episode", "➕ Qism / yangi fasl"),
+        ("del_media", "🗑 Kontent o'chirish"),
+        ("del_season", "🗑 Fasl o'chirish"),
+        ("rename_media", "✏️ Nom / kodni tahrirlash"),
+        ("edit_poster", "🖼 Posterni tahrirlash"),
+        ("stats", "📊 Statistika"),
+        ("broadcast", "📣 Hammaga xabar yuborish"),
+        ("appearance", "🎨 Tugma ranglari"),
+        ("owner_settings", "⚙️ Bot sozlamalari"),
+        ("manage_users", "👥 Obunachilarni boshqarish"),
+        ("owner_vip", "💎 VIP yoqish/o'chirish"),
+        ("owner_orders", "🛒 Buyurtmalar"),
+        ("owner_complaints", "📝 Shikoyatlar"),
+        ("owner_backup", "💾 Zaxira olish"),
+    ]),
+]
+BUTTON_EMOJI_LABELS = {key: label for _, _, items in BUTTON_EMOJI_GROUPS for key, label in items}
+
+
+def _button_emoji_mark(value):
+    if not value:
+        return "▫️"
+    return "✅" if str(value).isdigit() else str(value)
+
+
+def _extract_custom_emoji_id(message: Message):
+    """Premium emoji yuborilgan bo'lsa, uning custom_emoji_id sini oladi."""
+    for entity in (message.entities or []):
+        if entity.type == "custom_emoji" and getattr(entity, "custom_emoji_id", None):
+            return str(entity.custom_emoji_id)
+    return ""
+
+
+async def _probe_custom_emoji(emoji_id, chat_id) -> bool:
+    """Premium emoji ID ni sinab ko'radi: botga ruxsat bor-yo'qligini aniqlaydi."""
+    try:
+        probe = TelegramInlineKeyboardButton(text="✅ Emoji test", callback_data="emoji_probe", icon_custom_emoji_id=str(emoji_id))
+    except TypeError:
+        _CUSTOM_EMOJI_STATE["allowed"] = False
+        return False
+    try:
+        sent = await bot.send_message(chat_id, "🧪 Premium emoji tekshirilmoqda…", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[probe]]))
+    except TelegramBadRequest as exc:
+        logging.warning("Premium emoji tekshiruvi muvaffaqiyatsiz: %s", exc)
+        if _is_custom_emoji_error(exc):
+            _CUSTOM_EMOJI_STATE["allowed"] = False
+            return False
+        return True
+    except Exception:
+        logging.exception("Premium emoji tekshiruvida xatolik")
+        return True
+    _CUSTOM_EMOJI_STATE["allowed"] = True
+    try:
+        await bot.delete_message(sent.chat.id, sent.message_id)
+    except Exception:
+        pass
+    return True
+
+
+async def verify_custom_emoji_support():
+    """Ishga tushishda saqlangan emojilardan birini sinab ko'radi."""
+    emojis = load_data().get("settings", {}).get("button_emojis", {})
+    emoji_id = next((str(v) for v in emojis.values() if str(v).isdigit()), "")
+    if emoji_id and OWNER_ID:
+        await _probe_custom_emoji(emoji_id, OWNER_ID)
+
+
+@dp.callback_query(F.data == "button_emoji_menu")
+async def button_emoji_menu(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    await state.clear()
+    saved = load_data().get("settings", {}).get("button_emojis", {})
+    rows = []
+    for group_key, group_label, items in BUTTON_EMOJI_GROUPS:
+        count = sum(1 for key, _ in items if saved.get(key))
+        suffix = f" · {count} ta" if count else ""
+        rows.append([InlineKeyboardButton(text=f"{group_label}{suffix}", callback_data=f"button_emoji_group:{group_key}")])
+    rows.append([InlineKeyboardButton(text="♻️ Barcha emojilarni o'chirish", callback_data="button_emoji_reset")])
+    rows.append([InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")])
+    await call.message.answer(
+        "😀 <b>Tugmalarga emoji qo'shish</b>\n"
+        "1️⃣ Guruhni tanlang\n2️⃣ Tugmani tanlang\n3️⃣ Premium emoji ID sini yuboring\n\n"
+        "Premium emoji ID ni maxsus emojini botga yuborish orqali ham olishingiz mumkin — bot ID ni o'zi aniqlaydi. "
+        "Oddiy emoji (masalan 🔥) yuborsangiz, u tugma matni boshiga qo'shiladi.\n\n"
+        "ℹ️ Telegram premium emojini faqat Fragment'da username sotib olgan botlarda yoki "
+        "bot egasida Telegram Premium obunasi bo'lsa ko'rsatadi. Bot buni saqlash paytida avtomatik tekshiradi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("button_emoji_group:"))
+async def button_emoji_group(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    await state.clear()
+    group_key = call.data.split(":", 1)[1]
+    group = next(((label, items) for key, label, items in BUTTON_EMOJI_GROUPS if key == group_key), None)
+    if not group:
+        return await call.answer("⚠️ Guruh topilmadi", show_alert=True)
+    group_label, items = group
+    saved = load_data().get("settings", {}).get("button_emojis", {})
+    rows = []
+    for key, label in items:
+        mark = _button_emoji_mark(saved.get(key))
+        shown = label if len(label) <= 30 else label[:29] + "…"
+        rows.append([InlineKeyboardButton(text=f"{mark} {shown}", callback_data=f"button_emoji_pick:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="button_emoji_menu")])
+    await call.message.answer(f"😀 <b>{group_label}</b>\nEmoji qo'shmoqchi bo'lgan tugmani tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("button_emoji_pick:"))
+async def button_emoji_pick(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    key = call.data.split(":", 1)[1]
+    if key not in BUTTON_EMOJI_LABELS:
+        return await call.answer("⚠️ Tugma topilmadi", show_alert=True)
+    current = load_data().get("settings", {}).get("button_emojis", {}).get(key) or "yo'q"
+    await state.update_data(button_emoji_key=key)
+    await state.set_state(Form.button_emoji_value)
+    rows = []
+    if current != "yo'q":
+        rows.append([InlineKeyboardButton(text="🗑 Emojini o'chirish", callback_data=f"button_emoji_del:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="button_emoji_menu")])
+    await call.message.answer(
+        f"😀 <b>{BUTTON_EMOJI_LABELS[key]}</b>\nHozirgi emoji: <code>{current}</code>\n\n"
+        "Premium emoji ID sini yuboring (masalan <code>5368324170671202286</code>) "
+        "yoki premium emojining o'zini yuboring.\n"
+        "Oddiy emoji yuborsangiz, u tugma matni boshiga qo'shiladi.\n"
+        "Bekor qilish: /cancel",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+    await call.answer()
+
+
+@dp.message(Form.button_emoji_value)
+async def button_emoji_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Faqat owner uchun.")
+    raw = (message.text or "").strip()
+    if raw == "/cancel":
+        await state.clear()
+        return await message.answer("✅ Bekor qilindi.", reply_markup=owner_menu())
+    ctx = await state.get_data()
+    key = ctx.get("button_emoji_key")
+    if key not in BUTTON_EMOJI_LABELS:
+        await state.clear()
+        return await message.answer("⚠️ Tugma topilmadi. Qaytadan urinib ko'ring.")
+    custom_id = _extract_custom_emoji_id(message)
+    value = custom_id or raw
+    if not value:
+        return await message.answer("⚠️ Premium emoji ID sini yoki emojining o'zini yuboring. Bekor qilish: /cancel")
+    if custom_id or value.isdigit():
+        if len(value) < 5 or not value.isdigit():
+            return await message.answer("⚠️ Premium emoji ID faqat raqamlardan iborat bo'ladi. Qayta yuboring:")
+        if not await _probe_custom_emoji(value, message.from_user.id):
+            return await message.answer(
+                "❌ Bu premium emoji bilan tugma yuborilmadi.\n"
+                "Sabab: bot Fragment'da username sotib olmagan va bot egasida Telegram Premium yo'q, "
+                "emoji ID noto'g'ri yoki aiogram versiyasi eski (3.31.0 kerak).\n"
+                "Boshqa ID yuboring yoki /cancel bosing.",
+            )
+    elif len(value) > 8 or " " in value:
+        return await message.answer("⚠️ Faqat premium emoji ID (raqam) yoki bitta oddiy emoji yuboring. Qayta yuboring:")
+    data = load_data()
+    data.setdefault("settings", {}).setdefault("button_emojis", {})[key] = value
+    save_data(data)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>{BUTTON_EMOJI_LABELS[key]}</b> tugmasiga emoji saqlandi: <code>{value}</code>\n"
+        "Menyular qayta ochilganda ko'rinadi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="😀 Yana emoji qo'shish", callback_data="button_emoji_menu")],
+            [InlineKeyboardButton(text="👑 Owner paneli", callback_data="admin_home")],
+        ])
+    )
+
+
+@dp.callback_query(F.data.startswith("button_emoji_del:"))
+async def button_emoji_delete(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    key = call.data.split(":", 1)[1]
+    if key not in BUTTON_EMOJI_LABELS:
+        return await call.answer("⚠️ Tugma topilmadi", show_alert=True)
+    data = load_data()
+    data.setdefault("settings", {}).setdefault("button_emojis", {}).pop(key, None)
+    save_data(data)
+    await state.clear()
+    await call.answer("🗑 Emoji o'chirildi")
+    try:
+        await call.message.edit_text(
+            f"🗑 <b>{BUTTON_EMOJI_LABELS[key]}</b> tugmasidagi emoji o'chirildi.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Emoji menyusi", callback_data="button_emoji_menu")]])
+        )
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "button_emoji_reset")
+async def button_emoji_reset(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    data = load_data()
+    data.setdefault("settings", {}).pop("button_emojis", None)
+    save_data(data)
+    await button_emoji_menu(call, state)
+
 @dp.callback_query(F.data == "button_text_menu")
 async def button_text_menu(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -3211,7 +3516,8 @@ async def button_text_edit(call: CallbackQuery, state: FSMContext):
     await state.set_state(Form.button_text_value)
     await call.message.answer(
         f"Tanlangan tugma: <b>{EDITABLE_BUTTONS[key]}</b>\nYangi nomini yuboring (1–64 belgi). /cancel — bekor qilish.\n\n"
-        "Eslatma: Telegram inline tugma matnida Premium custom emoji ID/entity qo‘llab-quvvatlanmaydi. Oddiy emoji va matn ishlaydi."
+        "Eslatma: premium emoji tugma nomi ichida emas, alohida ikonka sifatida qo'shiladi — "
+        "buning uchun Owner panelidagi «😀 Tugmalarga emoji qo'shish» bo'limidan foydalaning."
     )
     await call.answer()
 
@@ -3726,6 +4032,8 @@ async def main():
         if admin_id and admin_id not in data.setdefault("admins", []):
             data["admins"].append(admin_id)
     save_data(data)
+    # Saqlangan premium emoji tugmalari ishlashini ishga tushishda bir marta tekshiramiz.
+    await verify_custom_emoji_support()
     runner = await start_web_server()
     vip_monitor_task = asyncio.create_task(vip_expiry_monitor())
     media_monitor_task = asyncio.create_task(media_monitor())
