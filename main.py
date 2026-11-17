@@ -12,12 +12,13 @@ import io
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from html import escape as _esc
+from urllib.parse import quote
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as TelegramInlineKeyboardButton, ReplyKeyboardRemove, BufferedInputFile, BotCommand
+    Message, CallbackQuery, ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton as TelegramInlineKeyboardButton, ReplyKeyboardRemove, BufferedInputFile, BotCommand
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -265,7 +266,7 @@ def default_data():
         "complaints": [],
         "order_seq": 0,
         "complaint_seq": 0,
-        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "button_emojis": {}, "maintenance": False, "vip_enabled": False, "vip_save_protection": True, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
+        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "button_emojis": {}, "maintenance": False, "vip_enabled": False, "vip_save_protection": True, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "referral_need": 3, "referral_vip_days": 3, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
     }
 
 
@@ -610,18 +611,69 @@ def media_caption(code: str, media: dict) -> str:
     return base[:1024]
 
 
+def vip_until_ts(user: dict) -> int:
+    """Saqlangan VIP tugash vaqtini epoch-soniyaga xavfsiz aylantiradi."""
+    if not isinstance(user, dict):
+        return 0
+    raw = user.get("vip_until", 0)
+    try:
+        if isinstance(raw, str):
+            text = raw.strip().replace(",", ".")
+            if not text:
+                return 0
+            try:
+                raw = float(text)
+            except ValueError:
+                parsed = datetime.fromisoformat(text)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return int(parsed.timestamp())
+        value = float(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    if value <= 0:
+        return 0
+    # Millisekundlarda yozib qo‘yilgan bo‘lsa, sekundga o‘tkazamiz.
+    if value > 10 ** 11:
+        value /= 1000
+    return int(value)
+
+
 def is_vip_user(user_id: int, data=None) -> bool:
     """Foydalanuvchining VIP muddati hali tugamaganini tekshiradi."""
     data = data or load_data()
-    user = data.get("users", {}).get(str(user_id), {})
-    return int(user.get("vip_until", 0) or 0) > now_ts()
+    users = data.get("users") or {}
+    user = users.get(str(user_id)) or users.get(user_id) or {}
+    return vip_until_ts(user) > now_ts()
+
+
+def as_bool(value, default=False) -> bool:
+    """Sozlama JSONdan matn ko‘rinishida qaytgan bo‘lsa ham to‘g‘ri o‘qiydi."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().casefold().replace("‘", "'").replace("’", "'")
+        if text in {"1", "true", "yes", "on", "ha", "yoq", "yoqilgan"}:
+            return True
+        if text in {"0", "false", "no", "off", "yo'q", "yoq emas", "o'chirilgan", "ochirilgan", ""}:
+            return False
+        return default
+    return default if value is None else bool(value)
 
 
 def should_protect_content(user_id: int, data=None) -> bool:
     """Himoya yoqilgan bo‘lsa, faqat VIP bo‘lmaganlarga saqlash/forwardni cheklaydi."""
     data = data or load_data()
-    enabled = bool(data.get("settings", {}).get("vip_save_protection", True))
-    return enabled and not is_vip_user(user_id, data)
+    # Bot egasi kontent egasi — unga cheklov qo‘yilmaydi.
+    if is_owner(user_id):
+        return False
+    enabled = as_bool(data.get("settings", {}).get("vip_save_protection", True), True)
+    vip = is_vip_user(user_id, data)
+    protect = enabled and not vip
+    logging.info("Saqlash himoyasi: user=%s vip=%s enabled=%s protect=%s", user_id, vip, enabled, protect)
+    return protect
 
 
 def media_available_for_user(user_id: int, media: dict, data=None) -> bool:
@@ -731,10 +783,11 @@ def channel_aliases(chat_ref, invite_url="") -> set:
     return aliases
 
 
-async def check_subscription(user_id: int) -> bool:
+async def check_subscription(user_id: int, ignore_vip: bool = False) -> bool:
     data = load_data()
     # VIP foydalanuvchi barcha majburiy obuna talablaridan ozod.
-    if is_vip_user(user_id, data):
+    # Referal esa faqat haqiqiy obuna bo'lganda hisoblanishi uchun ignore_vip bilan tekshiriladi.
+    if not ignore_vip and is_vip_user(user_id, data):
         return True
     channels = data.get("channels", [])
     pending_requests = data.setdefault("join_requests", {})
@@ -767,8 +820,11 @@ PURGE_TEXT = ("⚠️ <b>Diqqat!</b>\n\n"
               "Qayta foydalanish uchun kanallarga obuna bo'ling yoki 💎 VIP oling.")
 
 
-def track_media_msg(user_id: int, message_id):
-    """Foydalanuvchiga yuborilgan kino (media) xabarini eslab qoladi."""
+def track_media_msg(user_id: int, message_id, vip=None):
+    """Foydalanuvchiga yuborilgan kino (media) xabarini eslab qoladi.
+
+    VIP faol paytda yuborilganlar alohida saqlanadi — VIP tugagach o'shalar o'chiriladi.
+    """
     if not message_id:
         return
     data = load_data()
@@ -776,6 +832,12 @@ def track_media_msg(user_id: int, message_id):
     ids = [int(x) for x in (user.get("media_msgs") or [])]
     ids.append(int(message_id))
     user["media_msgs"] = ids[-300:]
+    if vip is None:
+        vip = is_vip_user(user_id, data)
+    if vip:
+        vip_ids = [int(x) for x in (user.get("vip_media_msgs") or [])]
+        vip_ids.append(int(message_id))
+        user["vip_media_msgs"] = vip_ids[-300:]
     save_data(data)
 
 
@@ -800,6 +862,7 @@ async def purge_user_media(user_id: int, notify: bool = True) -> int:
             pass
         await asyncio.sleep(0.04)
     user["media_msgs"] = []
+    user["vip_media_msgs"] = []
     save_data(data)
     if notify and deleted:
         try:
@@ -810,35 +873,171 @@ async def purge_user_media(user_id: int, notify: bool = True) -> int:
 
 
 async def enforce_subscription(user_id: int) -> bool:
-    """Obunani tekshiradi; chiqqan bo'lsa chatdagi kinolarni o'chiradi."""
-    if await check_subscription(user_id):
-        return True
-    await purge_user_media(user_id)
-    return False
+    """Obunani tekshiradi.
+
+    Kinolar faqat kanaldagi «chiqib ketdi» xabaridan (chat_member update) aniqlangan
+    foydalanuvchilardan o'chiriladi — kanal qo'shilganda hammani jazolab bo'lmaydi.
+    Obuna tasdiqlanganda referal ham bir marta hisoblanadi.
+    """
+    allowed = await check_subscription(user_id)
+    if allowed:
+        await credit_referral(user_id)
+    return allowed
 
 
-async def media_monitor():
-    """Har 10 daqiqada obunadan chiqqanlarni tekshirib, kinolarini o'chiradi."""
-    await asyncio.sleep(90)
-    while True:
+async def purge_vip_media(user_id: int, user: dict) -> int:
+    """VIP faol paytda yuborilgan kinolarni chatdan o'chiradi."""
+    ids = [int(x) for x in (user.get("vip_media_msgs") or [])]
+    if not ids:
+        return 0
+    removed = set(ids)
+    deleted = 0
+    for mid in ids:
         try:
-            data = load_data()
-            if data.get("channels"):
-                for uid_str, user in list(data.get("users", {}).items()):
-                    if not user.get("media_msgs"):
-                        continue
-                    try:
-                        uid = int(uid_str)
-                    except Exception:
-                        continue
-                    if is_vip_user(uid, data):
-                        continue
-                    if not await check_subscription(uid):
-                        await purge_user_media(uid)
-                    await asyncio.sleep(0.05)
+            await bot.delete_message(user_id, mid)
+            deleted += 1
         except Exception:
-            logging.exception("Media monitor error")
-        await asyncio.sleep(600)
+            pass
+        await asyncio.sleep(0.04)
+    user["vip_media_msgs"] = []
+    user["media_msgs"] = [x for x in (user.get("media_msgs") or []) if int(x) not in removed]
+    return deleted
+
+
+# ================= REFERAL TIZIMI =================
+REF_PREFIX = "ref_"
+REFERRAL_RULES = (
+    "• Har <b>{need} ta</b> do‘stingiz havola orqali botga kirsa — "
+    "<b>{vip_days} kunlik VIP</b> olasiz.\n"
+    "• Referal faqat do‘stingiz <b>barcha majburiy kanallarga obuna bo‘lgandan keyin</b> hisoblanadi.\n"
+    "• VIP muddati tugagach, VIP orqali ochilgan kinolar chatdan o‘chiriladi."
+)
+
+
+def ref_settings(data=None):
+    data = data or load_data()
+    cfg = data.get("settings", {})
+    need = max(1, int(cfg.get("referral_need", 3) or 3))
+    vip_days = max(1, int(cfg.get("referral_vip_days", 3) or 3))
+    return need, vip_days
+
+
+def parse_ref_payload(payload: str):
+    """«ref_123» yoki eski «123» ko‘rinishidagi start parametrini o‘qiydi."""
+    payload = str(payload or "").strip()
+    if payload.casefold().startswith(REF_PREFIX):
+        payload = payload[len(REF_PREFIX):]
+    if not payload.isdigit():
+        return None
+    value = int(payload)
+    return value if value > 0 else None
+
+
+def record_referrer(data, user_id: int, payload: str) -> bool:
+    """Yangi foydalanuvchiga taklif qiluvchini biriktiradi (faqat bir marta)."""
+    referrer = parse_ref_payload(payload)
+    if not referrer or referrer == int(user_id):
+        return False
+    users = data.setdefault("users", {})
+    if str(referrer) not in users:
+        return False
+    user = users.setdefault(str(user_id), {})
+    if user.get("referrer"):
+        return False
+    user["referrer"] = str(referrer)
+    user["referral_qualified"] = False
+    return True
+
+
+_REFERRAL_INFLIGHT = set()
+
+
+async def credit_referral(user_id: int) -> bool:
+    """Do‘st barcha kanallarga obuna bo‘lgach referalni hisoblaydi va VIP beradi."""
+    if int(user_id) in _REFERRAL_INFLIGHT:
+        return False
+    _REFERRAL_INFLIGHT.add(int(user_id))
+    try:
+        return await _credit_referral(user_id)
+    finally:
+        _REFERRAL_INFLIGHT.discard(int(user_id))
+
+
+async def _credit_referral(user_id: int) -> bool:
+    data = load_data()
+    users = data.get("users", {})
+    user = users.get(str(user_id))
+    if not user:
+        return False
+    referrer_key = str(user.get("referrer") or "")
+    if not referrer_key or user.get("referral_qualified") or user.get("referral_invalid"):
+        return False
+    inviter = users.get(referrer_key)
+    if not inviter:
+        user["referral_invalid"] = True
+        save_data(data)
+        return False
+    # VIP bo‘lishning o‘zi yetarli emas — barcha majburiy kanallarga a’zolik shart.
+    if not await check_subscription(user_id, ignore_vip=True):
+        return False
+    user["referral_qualified"] = True
+    user["referral_qualified_at"] = now_ts()
+    need, vip_days = ref_settings(data)
+    count = int(inviter.get("referrals_count", 0) or 0) + 1
+    inviter["referrals_count"] = count
+    reward_given = count % need == 0
+    if reward_given:
+        base = max(now_ts(), vip_until_ts(inviter))
+        inviter["vip_until"] = base + vip_days * 86400
+        inviter["referral_rewards"] = int(inviter.get("referral_rewards", 0) or 0) + 1
+        inviter.pop("vip_warned_until", None)
+    save_data(data)
+    logging.info("Referal hisoblandi: user=%s referrer=%s count=%s", user_id, referrer_key, count)
+    if reward_given:
+        try:
+            await bot.send_message(
+                int(referrer_key),
+                "🎉 <b>Tabriklaymiz!</b>\n\n"
+                f"👥 Taklif qilgan do‘stlaringiz: <b>{count}</b> ta\n"
+                f"💎 Mukofot: <b>{vip_days} kunlik VIP</b>\n"
+                f"⏳ VIP tugash vaqti: <b>{fmt_date(inviter['vip_until'])}</b>",
+            )
+        except Exception:
+            logging.info("Referal mukofoti xabari yuborilmadi: %s", referrer_key)
+    return True
+
+
+async def referral_text_and_link(user_id: int):
+    data = load_data()
+    user = data.get("users", {}).get(str(user_id), {})
+    count = int(user.get("referrals_count", 0) or 0)
+    need, vip_days = ref_settings(data)
+    left = need - (count % need)
+    rewards = int(user.get("referral_rewards", 0) or 0)
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start={REF_PREFIX}{user_id}"
+    text = (
+        "👥 <b>Referal tizimi</b>\n\n"
+        "🔗 Sizning taklif havolangiz:\n"
+        f"<code>{link}</code>\n\n"
+        "📋 <b>Qoidalar:</b>\n"
+        + REFERRAL_RULES.format(need=need, vip_days=vip_days)
+        + "\n\n"
+        f"📊 Taklif qilgan do‘stlar: <b>{count}</b> ta\n"
+        f"🎁 Keyingi mukofotgacha: <b>{left}</b> ta do‘st\n"
+        f"👑 Olingan VIP mukofotlar: <b>{rewards}</b> marta"
+    )
+    return text, link
+
+
+def referral_keyboard(link: str):
+    share = "https://t.me/share/url?url=" + quote(link) + "&text=" + quote(
+        "Do‘stim, bu botda kino va seriallar bor. Havola orqali kiring:"
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Do‘stlarga ulashish", url=share)],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
+    ])
 
 
 def subscription_keyboard():
@@ -882,7 +1081,12 @@ async def start(message: Message, state: FSMContext):
     # create_task bilan parallel ishlatish yangi userni oldindan saqlab, xabarni o'tkazib yuborardi.
     await notify_new_user(message.from_user)
     data = load_data()
-    ensure_user(data, message.from_user)
+    _user, is_new = ensure_user(data, message.from_user)
+    # Referal havolasi: /start ref_123 (eski /start 123 ham qo'llanadi).
+    parts = (message.text or "").split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+    if is_new and payload:
+        record_referrer(data, message.from_user.id, payload)
     save_data(data)
     if int(message.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
         return await message.answer("⛔ Siz botdan foydalanishdan chetlatilgansiz.")
@@ -894,13 +1098,24 @@ async def start(message: Message, state: FSMContext):
     await send_start(message)
 
 
+@dp.message(Command("ref"))
+async def ref_command(message: Message, state: FSMContext):
+    """Obunachiga referal havolasi va qoidalarini ko'rsatadi."""
+    await state.clear()
+    if not await require_subscription_message(message):
+        return
+    text, link = await referral_text_and_link(message.from_user.id)
+    await message.answer(text, reply_markup=referral_keyboard(link))
+
+
 @dp.callback_query(F.data == "owner_settings")
 async def owner_settings_callback(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     cfg = load_data().get("settings", {})
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"👥 Referal mukofoti: {cfg.get('referral_reward', 5000)} so‘m", callback_data="setcfg:referral_reward")],
+        [InlineKeyboardButton(text=f"👥 Referal: {cfg.get('referral_need', 3)} do‘st", callback_data="setcfg:referral_need")],
+        [InlineKeyboardButton(text=f"🎁 Referal mukofoti: {cfg.get('referral_vip_days', 3)} kunlik VIP", callback_data="setcfg:referral_vip_days")],
         [InlineKeyboardButton(text=f"👑 VIP 1 oy narxi: {cfg.get('vip_month_price', 15000)} so‘m", callback_data="setcfg:vip_month_price")],
         [InlineKeyboardButton(text=f"📅 VIP maksimal muddati: {cfg.get('vip_max_months', 6)} oy", callback_data="setcfg:vip_max_months")],
         [InlineKeyboardButton(text=f"⏳ VIP oy davomiyligi: {cfg.get('vip_duration_days', 30)} kun", callback_data="setcfg:vip_duration_days")],
@@ -923,7 +1138,8 @@ async def owner_setting_start(call: CallbackQuery, state: FSMContext):
     prompts = {
         "admin_contact": "To‘lov adminining username sini yuboring, masalan @obidov_xz:",
         "vip_month_price": "VIP obunasining 1 oylik narxini so‘mda yuboring:",
-        "referral_reward": "Har bir referal uchun beriladigan mukofotni so‘mda yuboring:",
+        "referral_need": "Nechta do‘st taklif qilinganda mukofot berilsin (masalan, 3):",
+        "referral_vip_days": "Referal mukofoti necha kunlik VIP bo‘lsin (masalan, 3):",
         "vip_max_months": "VIP uchun ruxsat etilgan maksimal oy sonini yuboring:",
         "vip_duration_days": "VIP obunasining bir oyi necha kun bo‘lishini yuboring:",
         "early_view_days": "VIP erta ko‘rish necha kun oldin bo‘lishini yuboring:",
@@ -960,11 +1176,11 @@ async def owner_setting_save(message: Message, state: FSMContext):
         value = raw
         if not value.startswith("@") or len(value) < 2 or " " in value:
             return await message.answer("⚠️ Username @ bilan boshlansin, masalan @AnimBot_Admin. Qayta yuboring:")
-    elif key in {"vip_max_months", "vip_duration_days", "early_view_days", "vip_month_price", "referral_reward"}:
+    elif key in {"vip_max_months", "vip_duration_days", "early_view_days", "vip_month_price", "referral_need", "referral_vip_days"}:
         try: value = int(raw)
         except ValueError: return await message.answer("🔢 Faqat raqam yuboring:")
         if value < 0: return await message.answer("⚠️ Qiymat manfiy bo‘lishi mumkin emas:")
-        if key in {"vip_max_months", "vip_duration_days"} and value < 1:
+        if key in {"vip_max_months", "vip_duration_days", "referral_need", "referral_vip_days"} and value < 1:
             return await message.answer("⚠️ Bu qiymat kamida 1 bo‘lishi kerak:")
     else:
         await state.clear()
@@ -973,7 +1189,7 @@ async def owner_setting_save(message: Message, state: FSMContext):
     data.setdefault("settings", {})[key] = value
     save_data(data)
     await state.clear()
-    labels = {"admin_contact": "To‘lov admini", "vip_month_price": "VIP oylik narxi", "referral_reward": "Referal mukofoti", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish"}
+    labels = {"admin_contact": "To‘lov admini", "vip_month_price": "VIP oylik narxi", "referral_need": "Referal uchun kerakli do‘stlar soni", "referral_vip_days": "Referal mukofoti (kun)", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish"}
     await message.answer(f"✅ {labels.get(key, key)} yangilandi: <b>{value}</b>\nO‘zgarish darhol kuchga kirdi.", reply_markup=owner_menu())
 
 
@@ -1256,7 +1472,7 @@ async def vip_confirm_callback(call: CallbackQuery):
     if balance < price: return await call.answer("💰 Balansingiz yetarli emas.",show_alert=True)
     # Takroriy callbackdan ikki marta pul yechilmasligi uchun balans tekshiruvi va yozish bir amalda.
     user['balance']=balance-price
-    base=max(now_ts(),int(user.get('vip_until',0) or 0))
+    base=max(now_ts(),vip_until_ts(user))
     user['vip_until']=base+months*int(cfg.get('vip_duration_days',30) or 30)*86400
     user.pop('vip_warned_until',None)
     save_data(data)
@@ -1294,7 +1510,7 @@ async def show_user_management(message: Message, user_id: int):
     if not user:
         return await message.answer("❌ Bu foydalanuvchi bazada topilmadi. U botda /start bosgan bo‘lishi kerak.")
     banned = user_id in [int(x) for x in data.get("banned_users", [])]
-    vip_until = int(user.get("vip_until", 0) or 0)
+    vip_until = vip_until_ts(user)
     mute_until = int(user.get("mute_until", 0) or 0)
     balance = float(user.get("balance", 0) or 0)
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1308,6 +1524,7 @@ async def show_user_management(message: Message, user_id: int):
         f"👤 <b>Foydalanuvchi</b>\nID: <code>{user_id}</code>\nUsername: @{user.get('username') or 'yo‘q'}"
         f"\nVIP: {'Faol (' + fmt_date(vip_until) + ')' if vip_until > now_ts() else 'Faol emas'}"
         f"\nBalans: {balance:g} so‘m\nMute: {fmt_date(mute_until) if mute_until > now_ts() else 'Yo‘q'}"
+        f"\nSaqlash/uzatish: {'cheklangan' if should_protect_content(user_id, data) else 'erkin'}"
         f"\nBan: {'Ha' if banned else 'Yo‘q'}", reply_markup=kb)
 
 
@@ -1495,6 +1712,7 @@ async def user_vip_amount_save(message: Message, state: FSMContext):
 async def user_vip_remove(call: CallbackQuery):
     if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
     uid=int(call.data.split(":",1)[1]); data=load_data(); user=data.get("users",{}).get(str(uid),{})
+    await purge_vip_media(uid, user)
     user["vip_until"]=0; save_data(data); await call.answer("❌ VIP bekor qilindi",show_alert=True); await show_user_management(call.message,uid)
 
 @dp.callback_query(F.data.startswith(("userbalance:","userbalanceout:")))
@@ -1703,6 +1921,7 @@ async def guide(call: CallbackQuery):
         "4️⃣ Serial bo‘lsa, kerakli faslni, keyin qism raqamini bosing.\n"
         "5️⃣ Qism ochilgach, pastdagi ⬅️ va ➡️ tugmalari bilan oldingi yoki keyingi qismga o‘ting.\n\n"
         "🔒 Agar bot majburiy kanalga obuna bo‘lishni so‘rasa, kanallarga qo‘shiling va «Obunani tekshirish»ni bosing.\n"
+        "👥 Do‘stlaringizni taklif qiling: har 3 ta do‘st uchun 3 kunlik VIP olasiz — /ref buyrug‘i orqali havolangizni oling.\n"
         "💎 Saqlash himoyasi yoqilganida VIP bo‘lmaganlar yuborilgan videoni Telegram orqali saqlay yoki boshqa joyga uzata olmaydi. VIP foydalanuvchilarga bu cheklov qo‘yilmaydi."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -3070,21 +3289,15 @@ async def start_text_save(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "referral")
 async def referral_callback(call: CallbackQuery):
+    if not await enforce_subscription(call.from_user.id):
+        return await call.answer("🔒 Avval majburiy kanallarga obuna bo‘ling yoki 💎 VIP oling.", show_alert=True)
+    text, link = await referral_text_and_link(call.from_user.id)
+    kb = referral_keyboard(link)
     try:
-        me = await call.bot.get_me()
-        link = f"https://t.me/{me.username}?start={call.from_user.id}"
-        data = load_data()
-        referrals = sum(1 for u in data.get("users", {}).values() if str(u.get("referrer", "")) == str(call.from_user.id))
-        reward = data.get("settings", {}).get("referral_reward", 5000)
-        text = (f"👥 <b>Referal</b>\n\nDo‘stlaringizga havolani yuboring:\n<code>{link}</code>\n\n"
-                f"👤 Taklif qilganlar: {referrals}\n💰 Har bir referal uchun: {reward} so‘m")
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
-        try:
-            await call.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await call.message.answer(text, reply_markup=kb)
-    finally:
-        await call.answer()
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
 
 
 @dp.callback_query(F.data == "account")
@@ -3092,11 +3305,14 @@ async def account_callback(call: CallbackQuery):
     data = load_data()
     user = data.setdefault("users", {}).get(str(call.from_user.id), {})
     balance = int(user.get("balance", 0) or 0)
-    vip_until = int(user.get("vip_until", 0) or 0)
-    vip_status = "✅ Ha" if vip_until > now_ts() else "❌ Yo‘q"
-    vip_date = fmt_date(vip_until) if vip_until > now_ts() else "—"
+    vip_until = vip_until_ts(user)
+    vip_active = vip_until > now_ts()
+    vip_status = "✅ Ha" if vip_active else "❌ Yo‘q"
+    vip_date = fmt_date(vip_until) if vip_active else "—"
+    storage = ("🔓 Saqlash/uzatish: erkin" if not should_protect_content(call.from_user.id, data)
+               else "🔒 Saqlash/uzatish: VIP bilan ochiladi")
     text = (f"👤 <b>Hisobim</b>\n\n🆔 ID: <code>{call.from_user.id}</code>\n"
-            f"💰 Balans: <b>{balance:,} so‘m</b>\n👑 VIP obunachi: <b>{vip_status}</b>\n📅 VIP muddati: <b>{vip_date}</b>".replace(",", " "))
+            f"💰 Balans: <b>{balance:,} so‘m</b>\n👑 VIP obunachi: <b>{vip_status}</b>\n📅 VIP muddati: <b>{vip_date}</b>\n{storage}".replace(",", " "))
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")], [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
     try: await call.message.edit_text(text, reply_markup=kb)
     except Exception: await call.message.answer(text, reply_markup=kb)
@@ -3131,18 +3347,18 @@ async def stats(call: CallbackQuery):
     cartoon_count = sum(1 for m in medias if m.get("media_type") == "cartoon")
     series_count = sum(1 for m in medias if m.get("media_type") in {"series", "drama"})
     downloads = data.get("downloads", {})
-    vip_ever = sum(1 for u in users if int(u.get("vip_until", 0) or 0) > 0)
-    vip_active = sum(1 for u in users if int(u.get("vip_until", 0) or 0) > now)
-    referral_total = sum(1 for u in users if u.get("referrer"))
-    referral_invites_recorded = sum(int(u.get("referrals_count", 0) or 0) for u in users)
-    referral_total = max(referral_total, referral_invites_recorded)
+    vip_ever = sum(1 for u in users if vip_until_ts(u) > 0)
+    vip_active = sum(1 for u in users if vip_until_ts(u) > now)
+    referral_total = sum(1 for u in users if u.get("referral_qualified"))
+    referral_pending = sum(1 for u in users if u.get("referrer") and not u.get("referral_qualified"))
+    referral_rewards = sum(int(u.get("referral_rewards", 0) or 0) for u in users)
     def downloads_in(days):
         return sum(1 for t in downloads.values() if isinstance(t, (int, float)) and t >= now - days * 86400) if isinstance(downloads, dict) else 0
     await call.message.answer(
         f"📊 <b>Statistika</b>\n• Obunachilar soni: {len(users)} ta\n• Faol obunachilar: {active30} ta\n• Tark etganlar: {inactive} ta\n\n"
         f"📈 <b>Obunachilar qo‘shilishi</b>\n• Oxirgi 24 soat: +{joined_in(1)} obunachi\n• Oxirgi 7 kun: +{joined_in(7)} obunachi\n• Oxirgi 30 kun: +{joined_in(30)} obunachi\n\n"
         f"💎 <b>VIP statistikasi</b>\n• VIP olganlar (qayd etilgan): {vip_ever} ta\n• Hozir VIP faol: {vip_active} ta\n\n"
-        f"👥 <b>Referal statistikasi</b>\n• Referal orqali kelganlar: {referral_total} ta\n\n"
+        f"👥 <b>Referal statistikasi</b>\n• Hisoblangan referallar: {referral_total} ta\n• Obunani kutayotganlar: {referral_pending} ta\n• Berilgan VIP mukofotlar: {referral_rewards} ta\n\n"
         f"📊 <b>Faollik</b>\n• Oxirgi 24 soatda faol: {seen_in(1)} ta\n• Oxirgi 7 kun faol: {seen_in(7)} ta\n• Oxirgi 30 kun faol: {active30} ta\n\n"
         f"📥 <b>Yuklanishlar</b>\n• Oxirgi 24 soat: {downloads_in(1)} ta\n• Oxirgi 7 kun: {downloads_in(7)} ta\n• Oxirgi 30 kun: {downloads_in(30)} ta\n\n"
         f"🎬 Kinolar soni: {movie_count} ta\n🍥 Anime: {anime_count} ta\n🎨 Multfilm: {cartoon_count} ta\n📺 Serial/drama: {series_count} ta"
@@ -3592,6 +3808,50 @@ async def broadcast_send(message: Message, state: FSMContext):
     await message.answer(f"📣 Xabar yuborish tugadi.\n✅ Yetkazildi: {sent}\n❌ Yetkazilmadi: {failed}", reply_markup=owner_menu())
 
 
+def _chat_status(value) -> str:
+    return str(value).split(".")[-1].lower()
+
+
+def is_mandatory_chat(chat, data=None) -> bool:
+    data = data or load_data()
+    aliases = set()
+    chat_id = getattr(chat, "id", None)
+    if chat_id is not None:
+        aliases |= channel_aliases(str(chat_id))
+    username = getattr(chat, "username", None)
+    if username:
+        aliases |= channel_aliases("@" + str(username))
+    if not aliases:
+        return False
+    for entry in data.get("channels", []):
+        chat_ref, invite_url, _raw = parse_channel_entry(entry)
+        if channel_aliases(chat_ref, invite_url) & aliases:
+            return True
+    return False
+
+
+@dp.chat_member()
+async def member_left_mandatory_channel(event: ChatMemberUpdated):
+    """Kanaldagi «foydalanuvchi chiqib ketdi» amali bo‘yicha faqat o‘shaning kinolarini o‘chiradi."""
+    try:
+        old_status = _chat_status(event.old_chat_member.status)
+        new_status = _chat_status(event.new_chat_member.status)
+        if old_status not in {"creator", "administrator", "member", "restricted"}:
+            return
+        if new_status not in {"left", "kicked"}:
+            return
+        data = load_data()
+        if not is_mandatory_chat(event.chat, data):
+            return
+        uid = int(event.new_chat_member.user.id)
+        if is_vip_user(uid, data):
+            return
+        deleted = await purge_user_media(uid)
+        logging.info("Majburiy kanaldan chiqdi: user=%s chat=%s deleted=%s", uid, getattr(event.chat, "id", ""), deleted)
+    except Exception:
+        logging.exception("chat_member update xatosi")
+
+
 @dp.chat_join_request()
 async def remember_channel_join_request(event):
     """Maxfiy majburiy kanalga so'rov yuborgan foydalanuvchini qayd etadi.
@@ -3994,14 +4254,18 @@ async def vip_expiry_monitor():
         try:
             data=load_data(); users=data.setdefault("users",{}); changed=False; now=now_ts()
             for uid, user in users.items():
-                until=int(user.get("vip_until",0) or 0)
+                until = vip_until_ts(user)
                 if until <= 0:
                     continue
                 if until <= now:
                     user["vip_until"]=0
                     user.pop("vip_warned_until",None)
                     changed=True
-                    try: await bot.send_message(int(uid), "⏰ VIP obunangiz muddati tugadi. VIP imkoniyatlari avtomatik o'chirildi.")
+                    purged = await purge_vip_media(int(uid), user)
+                    text = "⏰ VIP obunangiz muddati tugadi. VIP imkoniyatlari avtomatik o'chirildi."
+                    if purged:
+                        text += f"\n\n🗑 VIP orqali ochilgan {purged} ta kino chatdan o'chirildi."
+                    try: await bot.send_message(int(uid), text)
                     except Exception: pass
                 elif until-now <= 86400 and int(user.get("vip_warned_until",0) or 0) != until:
                     try:
@@ -4036,22 +4300,19 @@ async def main():
     await verify_custom_emoji_support()
     runner = await start_web_server()
     vip_monitor_task = asyncio.create_task(vip_expiry_monitor())
-    media_monitor_task = asyncio.create_task(media_monitor())
     try:
         from aiogram.types import BotCommandScopeChat
-        await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash")])
-        owner_commands = [BotCommand(command="start", description="Botni boshlash"), BotCommand(command="owner", description="Owner paneli"), BotCommand(command="admin", description="Admin paneli"), BotCommand(command="backup", description="Zaxira olish")]
+        user_commands = [BotCommand(command="start", description="Botni boshlash"), BotCommand(command="ref", description="Referal havola va qoidalar")]
+        await bot.set_my_commands(user_commands)
+        owner_commands = user_commands + [BotCommand(command="owner", description="Owner paneli"), BotCommand(command="admin", description="Admin paneli"), BotCommand(command="backup", description="Zaxira olish")]
         await bot.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
         for admin_id in set(ADMIN_IDS + [int(x) for x in data.get("admins", []) if str(x).isdigit()]):
             if admin_id and admin_id != OWNER_ID:
-                await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash"), BotCommand(command="admin", description="Admin paneli")], scope=BotCommandScopeChat(chat_id=admin_id))
+                await bot.set_my_commands(user_commands + [BotCommand(command="admin", description="Admin paneli")], scope=BotCommandScopeChat(chat_id=admin_id))
         await dp.start_polling(bot)
     finally:
         vip_monitor_task.cancel()
-        media_monitor_task.cancel()
         try: await vip_monitor_task
-        except asyncio.CancelledError: pass
-        try: await media_monitor_task
         except asyncio.CancelledError: pass
         await runner.cleanup()
         await bot.session.close()
