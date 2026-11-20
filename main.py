@@ -168,10 +168,19 @@ ADMIN_CONTACT = "@AnimBot_Admin"
 PAYMENT_CARD_ENV = os.getenv("PAYMENT_CARD", "").strip()
 PAYMENT_CARD_HOLDER_ENV = os.getenv("PAYMENT_CARD_HOLDER", "").strip()
 PAYMENT_CARD_BANK_ENV = os.getenv("PAYMENT_CARD_BANK", "").strip()
-# AI rejimi: OpenAI-mos keluvchi bepul API (standart — Pollinations, kalit talab qilmaydi).
+# AI rejimi: provayderlar zanjiri. Bepul kalitlardan biri bo'lsa — o'sha ishlatiladi.
+# 1) Gemini (bepul, rasmni ham o'qiydi) 2) Groq 3) OpenRouter 4) maxsus OpenAI-mos API
+# 5) Pollinations (kalitsiz, lekin IP uchun 45 soniyada 1 javob — zaxira sifatida).
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+# GEMINI_MODEL berilmasa, mavjud modellar API'dan avtomatik olinadi (2026'da nomlar o'zgarib turadi).
+GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "").split(",") if m.strip()]
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "").strip()
 AI_API_URL = os.getenv("AI_API_URL", "https://text.pollinations.ai/openai").strip()
 AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
-AI_MODEL = os.getenv("AI_MODEL", "openai").strip()
+AI_MODEL = os.getenv("AI_MODEL", "openai-fast").strip()
 # media postlari saqlanadigan kanal ID sini STORAGE_CHANNEL_ID environment variable orqali berish mumkin.
 CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "").strip()
 
@@ -3002,26 +3011,216 @@ def _ai_guess_from_text(reply: str, catalog: list, limit: int = 5) -> list:
     return scored
 
 
-async def _ai_request(messages: list) -> str:
-    headers = {"Content-Type": "application/json"}
+_AI_POLL_DOWN_UNTIL = 0.0
+_GEMINI_MODEL_CACHE = None
+_OPENROUTER_MODEL_CACHE = None
+
+
+async def _ai_gemini_models() -> list:
+    """GEMINI_MODEL berilmasa, kalitga ochiq flash modellarni avtomatik tanlaydi."""
+    global _GEMINI_MODEL_CACHE
+    if GEMINI_MODELS:
+        return GEMINI_MODELS
+    if _GEMINI_MODEL_CACHE:
+        return _GEMINI_MODEL_CACHE
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    headers={"x-goog-api-key": GEMINI_API_KEY}) as resp:
+                body = await resp.json()
+        picked = []
+        for item in body.get("models", []) or []:
+            name = str(item.get("name", "")).split("/")[-1]
+            low = name.lower()
+            methods = [str(x).lower() for x in (item.get("supportedGenerationMethods") or [])]
+            if "generatecontent" not in methods or not low.startswith("gemini"):
+                continue
+            if any(bad in low for bad in ("embedding", "tts", "image", "audio", "live", "veo", "imagen")):
+                continue
+            picked.append(name)
+        picked.sort(key=lambda n: (0 if "flash" in n else 1, len(n), n))
+        _GEMINI_MODEL_CACHE = picked[:5] or ["gemini-2.5-flash"]
+    except Exception:
+        logging.warning("Gemini modellari ro'yxati olinmadi, standart nomlar bilan urinamiz")
+        _GEMINI_MODEL_CACHE = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+    return _GEMINI_MODEL_CACHE
+
+
+async def _ai_openrouter_model(has_image: bool) -> str:
+    """Bepul va rasmni o'qiy oladigan modelni OpenRouter ro'yxatidan tanlaydi."""
+    global _OPENROUTER_MODEL_CACHE
+    if OPENROUTER_MODEL:
+        return OPENROUTER_MODEL
+    if _OPENROUTER_MODEL_CACHE:
+        return _OPENROUTER_MODEL_CACHE
+    fallback = "nvidia/nemotron-3.5-super-vl:free"
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://openrouter.ai/api/v1/models") as resp:
+                body = await resp.json()
+        candidates = []
+        for item in body.get("data", []) or []:
+            mid = str(item.get("id", ""))
+            if not mid.endswith(":free"):
+                continue
+            mods = (item.get("architecture") or {}).get("input_modalities") or []
+            has_img = "image" in mods
+            preferred = any(tag in mid for tag in ("gemini", "gemma", "nemotron", "ling", "particle"))
+            candidates.append((0 if has_img else 1, 0 if preferred else 1, mid))
+        candidates.sort()
+        _OPENROUTER_MODEL_CACHE = candidates[0][2] if candidates else fallback
+    except Exception:
+        _OPENROUTER_MODEL_CACHE = fallback
+    return _OPENROUTER_MODEL_CACHE
+
+
+def _ai_has_vision() -> bool:
+    """Kalitli provayderlardan biri rasmni o'qiy oladimi."""
+    return bool(GEMINI_API_KEY or GROQ_API_KEY or OPENROUTER_API_KEY or AI_API_KEY)
+
+
+def _ai_provider_chain(has_image: bool) -> list:
+    chain = []
+    if GEMINI_API_KEY:
+        chain.append("gemini")
+    if GROQ_API_KEY:
+        chain.append("groq")
+    if OPENROUTER_API_KEY:
+        chain.append("openrouter")
     if AI_API_KEY:
-        headers["Authorization"] = f"Bearer {AI_API_KEY}"
-    payload = {"model": AI_MODEL or "openai", "messages": messages, "temperature": 0.2}
-    timeout = aiohttp.ClientTimeout(total=35)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(AI_API_URL, json=payload, headers=headers) as resp:
+        chain.append("custom")
+    # Pollinations anonim tarifi rasmni qo'llamaydi va IP uchun 45 soniyada 1 javob beradi.
+    if not has_image:
+        chain.append("pollinations")
+    return chain
+
+
+async def _ai_post_json(url: str, payload: dict, headers: dict | None = None, timeout: int = 45) -> dict:
+    merged = {"Content-Type": "application/json"}
+    if headers:
+        merged.update(headers)
+    client_timeout = aiohttp.ClientTimeout(total=timeout)
+    async with aiohttp.ClientSession(timeout=client_timeout) as session:
+        async with session.post(url, json=payload, headers=merged) as resp:
             text = await resp.text()
             if resp.status != 200:
-                raise RuntimeError(f"HTTP {resp.status}: {text[:180]}")
+                raise RuntimeError(f"HTTP {resp.status}: {text[:220]}")
             try:
-                body = json.loads(text)
+                return json.loads(text)
             except ValueError as exc:
                 raise RuntimeError("API javobi JSON emas") from exc
+
+
+def _ai_openai_messages(prompt: str, image_b64: str = "", mime: str = "image/jpeg") -> list:
+    if image_b64:
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
+        ]
+    else:
+        content = prompt
+    return [{"role": "user", "content": content}]
+
+
+async def _ai_ask_gemini(prompt: str, image_b64: str = "", mime: str = "image/jpeg") -> str:
+    parts = [{"text": prompt}]
+    if image_b64:
+        parts.append({"inline_data": {"mime_type": mime, "data": image_b64}})
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900, "responseMimeType": "application/json"},
+    }
+    last_error = None
+    for model in await _ai_gemini_models():
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            body = await _ai_post_json(url, payload, {"x-goog-api-key": GEMINI_API_KEY})
+        except RuntimeError as exc:
+            last_error = exc
+            continue
+        candidates = body.get("candidates") or []
+        if not candidates:
+            last_error = RuntimeError(f"{model}: javob bo'sh (bloklangan?)")
+            continue
+        chunks = (candidates[0].get("content") or {}).get("parts") or []
+        text = "".join(str(chunk.get("text") or "") for chunk in chunks).strip()
+        if text:
+            return text
+        last_error = RuntimeError(f"{model}: matn qaytmadi")
+    raise last_error or RuntimeError("Gemini javob bermadi")
+
+
+async def _ai_ask_openai_compatible(url, api_key, model, prompt, image_b64="", mime="image/jpeg", extra_headers=None, timeout=45) -> str:
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if extra_headers:
+        headers.update(extra_headers)
+    payload = {
+        "model": model,
+        "messages": _ai_openai_messages(prompt, image_b64, mime),
+        "temperature": 0.2,
+        "max_tokens": 900,
+    }
+    body = await _ai_post_json(url, payload, headers, timeout=timeout)
     choices = body.get("choices") or []
     if not choices:
         raise RuntimeError("API bo'sh javob qaytardi")
     message = choices[0].get("message") or {}
+    text = str(message.get("content") or "").strip()
+    if not text:
+        raise RuntimeError("API matn qaytarmadi")
+    return text
+
+
+async def _ai_ask_pollinations(prompt: str, image_b64: str = "", mime: str = "image/jpeg") -> str:
+    global _AI_POLL_DOWN_UNTIL
+    if time.monotonic() < _AI_POLL_DOWN_UNTIL:
+        raise RuntimeError("Pollinations hozircha band (limit)")
+    if image_b64:
+        raise RuntimeError("Pollinations anonim tarifi rasmni qo'llamaydi")
+    payload = {"model": AI_MODEL or "openai-fast", "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
+    headers = {"Referer": "https://kinora-bot.example"}
+    try:
+        body = await _ai_post_json(AI_API_URL, payload, headers, timeout=40)
+    except RuntimeError as exc:
+        match = re.search(r"Retry after (\d+)s", str(exc), flags=re.I)
+        if match:
+            _AI_POLL_DOWN_UNTIL = time.monotonic() + int(match.group(1)) + 2
+        elif "HTTP 429" in str(exc) or "HTTP 402" in str(exc):
+            _AI_POLL_DOWN_UNTIL = time.monotonic() + 47
+        raise
+    choices = body.get("choices") or []
+    if not choices:
+        raise RuntimeError("Pollinations bo'sh javob qaytardi")
+    message = choices[0].get("message") or {}
     return str(message.get("content") or "")
+
+
+async def _ai_request(prompt: str, image_b64: str = "", mime: str = "image/jpeg") -> str:
+    """Provayderlar zanjiri: birinchisi ishlamasa, keyingisiga o'tadi."""
+    errors = []
+    for provider in _ai_provider_chain(bool(image_b64)):
+        try:
+            if provider == "gemini":
+                return await _ai_ask_gemini(prompt, image_b64, mime)
+            if provider == "groq":
+                return await _ai_ask_openai_compatible(
+                    "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_MODEL, prompt, image_b64, mime)
+            if provider == "openrouter":
+                model = await _ai_openrouter_model(bool(image_b64))
+                return await _ai_ask_openai_compatible(
+                    "https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, model, prompt,
+                    image_b64, mime, {"HTTP-Referer": "https://kinora-bot.example", "X-Title": "KINO Bot AI"})
+            if provider == "custom":
+                return await _ai_ask_openai_compatible(AI_API_URL, AI_API_KEY, AI_MODEL or "openai-fast", prompt, image_b64, mime)
+            if provider == "pollinations":
+                return await _ai_ask_pollinations(prompt, image_b64, mime)
+        except Exception as exc:
+            errors.append(f"{provider}: {exc}")
+            logging.warning("AI provayderi %s ishlamadi: %s", provider, exc)
+    raise RuntimeError("; ".join(errors) or "AI provayderi sozlanmagan")
 
 
 def local_media_search(query: str, data, limit: int = 5) -> list:
@@ -3100,23 +3299,29 @@ async def ai_query_handle(message: Message, state: FSMContext):
         return await message.answer("📭 Botda hali kontent yo'q. Keyinroq urinib ko'ring.", reply_markup=main_menu(message.from_user.id))
     valid_codes = {item["code"] for item in catalog}
     prompt = _ai_prompt(catalog)
-    content = [{"type": "text", "text": (prompt + "\n\nFoydalanuvchi so'rovi: " + (text or "rasmdagi kontent"))}]
+    image_b64 = ""
     if photo:
+        if not _ai_has_vision():
+            return await message.answer(
+                "🖼 Rasm bo'yicha qidiruv hozircha yoqilmagan. Kontentni so'z bilan tasvirlab yozing — bot bazadan topib beradi.\n\nBekor qilish: /cancel",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")],
+                ]))
         try:
             buffer = io.BytesIO()
             await bot.download(photo.file_id, destination=buffer)
-            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+            image_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
         except Exception:
             logging.exception("AI uchun rasm yuklab olinmadi")
             await state.clear()
             return await message.answer(
                 "🖼 Rasmni o'qib bo'lmadi. Iltimos, kontentni so'z bilan tasvirlab yozing:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🤖 AI rejimi", callback_data="ai_mode")]]))
+    full_prompt = prompt + "\n\nFoydalanuvchi so'rovi: " + (text or "rasmdagi kontent")
     status = await message.answer("⏳ AI qidirmoqda, biroz kuting…")
     reply_text = ""
     try:
-        reply_text = await _ai_request([{"role": "user", "content": content}])
+        reply_text = await _ai_request(full_prompt, image_b64)
         codes = _extract_ai_codes(reply_text, valid_codes) or _ai_guess_from_text(reply_text, catalog)
     except Exception as exc:
         logging.warning("AI so'rovi muvaffaqiyatsiz: %s", exc)
