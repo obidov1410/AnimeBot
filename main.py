@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -168,19 +167,6 @@ ADMIN_CONTACT = "@AnimBot_Admin"
 PAYMENT_CARD_ENV = os.getenv("PAYMENT_CARD", "").strip()
 PAYMENT_CARD_HOLDER_ENV = os.getenv("PAYMENT_CARD_HOLDER", "").strip()
 PAYMENT_CARD_BANK_ENV = os.getenv("PAYMENT_CARD_BANK", "").strip()
-# AI rejimi: provayderlar zanjiri. Bepul kalitlardan biri bo'lsa — o'sha ishlatiladi.
-# 1) Gemini (bepul, rasmni ham o'qiydi) 2) Groq 3) OpenRouter 4) maxsus OpenAI-mos API
-# 5) Pollinations (kalitsiz, lekin IP uchun 45 soniyada 1 javob — zaxira sifatida).
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
-# GEMINI_MODEL berilmasa, mavjud modellar API'dan avtomatik olinadi (2026'da nomlar o'zgarib turadi).
-GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "").split(",") if m.strip()]
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "").strip()
-AI_API_URL = os.getenv("AI_API_URL", "https://text.pollinations.ai/openai").strip()
-AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
-AI_MODEL = os.getenv("AI_MODEL", "openai-fast").strip()
 # media postlari saqlanadigan kanal ID sini STORAGE_CHANNEL_ID environment variable orqali berish mumkin.
 CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "").strip()
 
@@ -472,7 +458,7 @@ def main_menu(user_id=None):
         [InlineKeyboardButton(text="👤 Hisobim", callback_data="account"), InlineKeyboardButton(text="👥 Referal", callback_data="referral")],
         [InlineKeyboardButton(text="💰 Balans to‘ldirish", callback_data="topup"), InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
         [InlineKeyboardButton(text="❓ VIP o‘zi nima?", callback_data="vip_info")],
-        [InlineKeyboardButton(text="🤖 AI rejimi", callback_data="ai_mode"), InlineKeyboardButton(text="🔥 Top ko‘rilganlar", callback_data="top_viewed")],
+        [InlineKeyboardButton(text="🔥 Top ko‘rilganlar", callback_data="top_viewed")],
         [InlineKeyboardButton(text="🛒 Buyurtma berish", callback_data="order_new"), InlineKeyboardButton(text="📝 Shikoyat", callback_data="complaint_new")],
         [InlineKeyboardButton(text="📞 Admin bilan bog‘lanish", callback_data="contact_admin")],
         [InlineKeyboardButton(text="📖 Qo‘llanma", callback_data="guide")],
@@ -527,6 +513,7 @@ def owner_menu():
         [InlineKeyboardButton(text="🍥 Anime qo'shish", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm qo'shish", callback_data="newtype:cartoon")],
         [InlineKeyboardButton(text="➕ Qism yoki yangi sezon", callback_data="add_episode"), InlineKeyboardButton(text="🗑 Kontent o'chirish", callback_data="del_media")],
         [InlineKeyboardButton(text="🗑 Fasl o'chirish", callback_data="del_season")],
+        [InlineKeyboardButton(text="💎 VIP fasl / qismlar", callback_data="vip_seasons_menu")],
         [InlineKeyboardButton(text="✏️ Nom / kodni tahrirlash", callback_data="rename_media"), InlineKeyboardButton(text="🖼 Posterni tahrirlash", callback_data="edit_poster")],
         [InlineKeyboardButton(text="👤 Admin qo'shish", callback_data="add_admin"), InlineKeyboardButton(text="➖ Admin o'chirish", callback_data="del_admin")],
         [InlineKeyboardButton(text="🔐 Admin huquqlarini sozlash", callback_data="admin_permissions")],
@@ -591,7 +578,8 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
         if not visible_seasons:
             visible_seasons = season_keys
         for sn in visible_seasons:
-            row.append(InlineKeyboardButton(text=f"📺 {sn}-fasl", callback_data=f"season_show:{code}:{sn}"))
+            vip_mark = " 💎" if as_bool((seasons.get(sn) or {}).get("vip"), False) else ""
+            row.append(InlineKeyboardButton(text=f"📺 {sn}-fasl{vip_mark}", callback_data=f"season_show:{code}:{sn}"))
             if len(row) == 3:
                 rows.append(row); row=[]
         if row: rows.append(row)
@@ -616,7 +604,8 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
         page_numbers = sorted_numbers[page * page_size:(page + 1) * page_size]
         # Kino va serial qismlari faqat raqam bilan ko'rsatiladi: 1, 2, 3...
         for number in page_numbers:
-            row.append(InlineKeyboardButton(text=str(number), callback_data=f"episode:{code}:{season}:{number}"))
+            vip_mark = "💎" if episode_is_vip(media, season, number) else ""
+            row.append(InlineKeyboardButton(text=f"{number}{vip_mark}", callback_data=f"episode:{code}:{season}:{number}"))
             if len(row) == 5:
                 rows.append(row); row=[]
         if row: rows.append(row)
@@ -638,6 +627,8 @@ def media_caption(code: str, media: dict) -> str:
     seasons = media.get("seasons") or {"1": {"episodes": media.get("episodes", {})}}
     total_episodes = sum(len(value.get("episodes", {})) for value in seasons.values())
     base = f"{kind}: <b>{media['name']}</b>\n\n🔢 Kod: <code>{code}</code>\n📺 Fasllar: {len(seasons)}\n🎞 Qismlar: {total_episodes}"
+    if media_has_vip(media):
+        base += "\n💎 Ba'zi fasl/qismlar VIP uchun"
     if media.get("status"):
         base += f"\n📊 Holati: {media['status']}"
     if media.get("quality"):
@@ -735,6 +726,34 @@ def record_view(code: str):
         logging.exception("Ko'rishlar sonini saqlashda xatolik")
 
 
+def season_is_vip(media: dict, season_no) -> bool:
+    season = (media.get("seasons") or {}).get(str(season_no)) or {}
+    return as_bool(season.get("vip"), False)
+
+
+def episode_is_vip(media: dict, season_no, ep_no) -> bool:
+    """Fasl VIP bo'lsa — uning hamma qismi VIP; aks holda qism belgisi tekshiriladi."""
+    if season_is_vip(media, season_no):
+        return True
+    season = (media.get("seasons") or {}).get(str(season_no)) or {}
+    record = (season.get("episodes") or {}).get(str(ep_no))
+    if record is None:
+        record = (media.get("episodes") or {}).get(str(ep_no))
+    return isinstance(record, dict) and as_bool(record.get("vip"), False)
+
+
+def media_has_vip(media: dict) -> bool:
+    for season in (media.get("seasons") or {}).values():
+        if not isinstance(season, dict):
+            continue
+        if as_bool(season.get("vip"), False):
+            return True
+        for record in (season.get("episodes") or {}).values():
+            if isinstance(record, dict) and as_bool(record.get("vip"), False):
+                return True
+    return False
+
+
 async def send_media_card(chat_id: int, code: str, media: dict):
     data = load_data()
     caption = media_caption(code, media)
@@ -768,6 +787,9 @@ class Form(StatesGroup):
     delete_episode_number = State()
     delete_season_code = State()
     delete_season_number = State()
+    vip_mark_code = State()
+    vip_mark_season = State()
+    vip_mark_episodes = State()
     rename_code = State()
     rename_name = State()
     recode_old = State()
@@ -786,7 +808,6 @@ class Form(StatesGroup):
     topup_amount = State()
     topup_receipt = State()
     payment_card_edit = State()
-    ai_query = State()
     edit_poster_code = State()
     edit_poster_file = State()
     admin_permissions_id = State()
@@ -2735,6 +2756,15 @@ async def send_episode(call: CallbackQuery):
         if not episode or not isinstance(episode, dict):
             await call.answer("⏳ Bu qism hali qo'shilmagan.", show_alert=True)
             return
+        if episode_is_vip(media, season_number, number) and not is_vip_user(call.from_user.id, current_data):
+            await call.message.answer(
+                f"💎 <b>{media.get('name', 'Kontent')}</b> — {season_number}-fasl, {number}-qism faqat VIP obunachilar uchun.\n\n"
+                "VIP olish uchun quyidagi tugmani bosing:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
+                    [InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"season_show:{code}:{season_number}")],
+                ]))
+            return await call.answer()
         user = current_data.setdefault("users", {}).setdefault(str(call.from_user.id), {})
         user["last_watched"] = {"code": code, "season": season_number, "number": number, "media_type": media.get("media_type", "series"), "updated_at": now_ts()}
         save_data(current_data)
@@ -2928,426 +2958,6 @@ async def show_media(call: CallbackQuery):
     await send_media_card(call.from_user.id, code, item)
     # Faqat poster va mavjud qismlar tugmalari ko'rsatiladi; qism avtomatik yuborilmaydi.
     await call.answer()
-
-
-# ================= AI REJIMI =================
-# Bepul OpenAI-mos API (standart: Pollinations) orqali tavsif yoki rasm bo'yicha
-# bot bazasidan mos anime/kino/multfilmni topadi. API ishlamasa — lokal qidiruv.
-_AI_LAST_REQUEST = {}
-
-
-def _ai_rate_ok(user_id: int) -> bool:
-    now = time.time()
-    last = float(_AI_LAST_REQUEST.get(int(user_id), 0) or 0)
-    if now - last < 3:
-        return False
-    _AI_LAST_REQUEST[int(user_id)] = now
-    return True
-
-
-def _ai_catalog(data) -> list:
-    items = []
-    for code, media in data.get("medias", {}).items():
-        if not media_available_for_user(0, media, data):
-            continue
-        items.append({
-            "code": str(code),
-            "name": str(media.get("name") or ""),
-            "type": str(media.get("media_type") or "series"),
-            "genres": str(media.get("genres") or ""),
-            "description": str(media.get("description") or ""),
-        })
-    return items
-
-
-def _ai_prompt(catalog: list) -> str:
-    lines = []
-    for item in catalog[:150]:
-        extra = ", ".join(x for x in (item["genres"], item["description"][:80]) if x)
-        label = {"movie": "kino", "series": "serial", "anime": "anime", "cartoon": "multfilm", "drama": "drama"}.get(item["type"], "kontent")
-        lines.append(f"- kod {item['code']} | {label} | {item['name']}" + (f" | {extra}" if extra else ""))
-    return (
-        "Sen kino va anime botining yordamchisisan. Foydalanuvchi kontentni so'z bilan "
-        "tasvirlaydi yoki rasm yuboradi. Quyidagi bazadan eng mos 1-5 ta kontentni tanla.\n"
-        "Faqat JSON qaytar: {\"codes\": [\"kod1\", \"kod2\"], \"reason\": \"qisqa izoh\"}.\n"
-        "Agar mos kontent bo'lmasa: {\"codes\": [], \"reason\": \"sabab\"}.\n\n"
-        "Baza:\n" + "\n".join(lines)
-    )
-
-
-def _extract_ai_codes(reply: str, valid_codes: set) -> list:
-    text = str(reply or "")
-    data = None
-    match = re.search(r"\{.*\}", text, flags=re.S)
-    if match:
-        try:
-            data = json.loads(match.group(0))
-        except (ValueError, TypeError):
-            data = None
-    found = []
-    if isinstance(data, dict):
-        for raw in data.get("codes", []) or []:
-            code = str(raw).strip()
-            if code in valid_codes and code not in found:
-                found.append(code)
-    if not found:
-        # JSON buzilgan bo'lsa, javobdagi mavjud kodlarni qidiramiz.
-        for raw in re.findall(r"\b\d{1,7}\b", text):
-            if raw in valid_codes and raw not in found:
-                found.append(raw)
-    return found[:5]
-
-
-def _ai_guess_from_text(reply: str, catalog: list, limit: int = 5) -> list:
-    """AI kod o'rniga nom qaytarsa, nomlarni bazadagi kontentga moslaydi."""
-    text = str(reply or "").casefold()
-    scored = []
-    for item in catalog:
-        name = item["name"].casefold()
-        if len(name) >= 3 and name in text:
-            scored.append(item["code"])
-        if len(scored) >= limit:
-            break
-    return scored
-
-
-_AI_POLL_DOWN_UNTIL = 0.0
-_GEMINI_MODEL_CACHE = None
-_OPENROUTER_MODEL_CACHE = None
-
-
-async def _ai_gemini_models() -> list:
-    """GEMINI_MODEL berilmasa, kalitga ochiq flash modellarni avtomatik tanlaydi."""
-    global _GEMINI_MODEL_CACHE
-    if GEMINI_MODELS:
-        return GEMINI_MODELS
-    if _GEMINI_MODEL_CACHE:
-        return _GEMINI_MODEL_CACHE
-    try:
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                    "https://generativelanguage.googleapis.com/v1beta/models",
-                    headers={"x-goog-api-key": GEMINI_API_KEY}) as resp:
-                body = await resp.json()
-        picked = []
-        for item in body.get("models", []) or []:
-            name = str(item.get("name", "")).split("/")[-1]
-            low = name.lower()
-            methods = [str(x).lower() for x in (item.get("supportedGenerationMethods") or [])]
-            if "generatecontent" not in methods or not low.startswith("gemini"):
-                continue
-            if any(bad in low for bad in ("embedding", "tts", "image", "audio", "live", "veo", "imagen")):
-                continue
-            picked.append(name)
-        picked.sort(key=lambda n: (0 if "flash" in n else 1, len(n), n))
-        _GEMINI_MODEL_CACHE = picked[:5] or ["gemini-2.5-flash"]
-    except Exception:
-        logging.warning("Gemini modellari ro'yxati olinmadi, standart nomlar bilan urinamiz")
-        _GEMINI_MODEL_CACHE = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
-    return _GEMINI_MODEL_CACHE
-
-
-async def _ai_openrouter_model(has_image: bool) -> str:
-    """Bepul va rasmni o'qiy oladigan modelni OpenRouter ro'yxatidan tanlaydi."""
-    global _OPENROUTER_MODEL_CACHE
-    if OPENROUTER_MODEL:
-        return OPENROUTER_MODEL
-    if _OPENROUTER_MODEL_CACHE:
-        return _OPENROUTER_MODEL_CACHE
-    fallback = "nvidia/nemotron-3.5-super-vl:free"
-    try:
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get("https://openrouter.ai/api/v1/models") as resp:
-                body = await resp.json()
-        candidates = []
-        for item in body.get("data", []) or []:
-            mid = str(item.get("id", ""))
-            if not mid.endswith(":free"):
-                continue
-            mods = (item.get("architecture") or {}).get("input_modalities") or []
-            has_img = "image" in mods
-            preferred = any(tag in mid for tag in ("gemini", "gemma", "nemotron", "ling", "particle"))
-            candidates.append((0 if has_img else 1, 0 if preferred else 1, mid))
-        candidates.sort()
-        _OPENROUTER_MODEL_CACHE = candidates[0][2] if candidates else fallback
-    except Exception:
-        _OPENROUTER_MODEL_CACHE = fallback
-    return _OPENROUTER_MODEL_CACHE
-
-
-def _ai_has_vision() -> bool:
-    """Kalitli provayderlardan biri rasmni o'qiy oladimi."""
-    return bool(GEMINI_API_KEY or GROQ_API_KEY or OPENROUTER_API_KEY or AI_API_KEY)
-
-
-def _ai_provider_chain(has_image: bool) -> list:
-    chain = []
-    if GEMINI_API_KEY:
-        chain.append("gemini")
-    if GROQ_API_KEY:
-        chain.append("groq")
-    if OPENROUTER_API_KEY:
-        chain.append("openrouter")
-    if AI_API_KEY:
-        chain.append("custom")
-    # Pollinations anonim tarifi rasmni qo'llamaydi va IP uchun 45 soniyada 1 javob beradi.
-    if not has_image:
-        chain.append("pollinations")
-    return chain
-
-
-async def _ai_post_json(url: str, payload: dict, headers: dict | None = None, timeout: int = 45) -> dict:
-    merged = {"Content-Type": "application/json"}
-    if headers:
-        merged.update(headers)
-    client_timeout = aiohttp.ClientTimeout(total=timeout)
-    async with aiohttp.ClientSession(timeout=client_timeout) as session:
-        async with session.post(url, json=payload, headers=merged) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                raise RuntimeError(f"HTTP {resp.status}: {text[:220]}")
-            try:
-                return json.loads(text)
-            except ValueError as exc:
-                raise RuntimeError("API javobi JSON emas") from exc
-
-
-def _ai_openai_messages(prompt: str, image_b64: str = "", mime: str = "image/jpeg") -> list:
-    if image_b64:
-        content = [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
-        ]
-    else:
-        content = prompt
-    return [{"role": "user", "content": content}]
-
-
-async def _ai_ask_gemini(prompt: str, image_b64: str = "", mime: str = "image/jpeg") -> str:
-    parts = [{"text": prompt}]
-    if image_b64:
-        parts.append({"inline_data": {"mime_type": mime, "data": image_b64}})
-    payload = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900, "responseMimeType": "application/json"},
-    }
-    last_error = None
-    for model in await _ai_gemini_models():
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        try:
-            body = await _ai_post_json(url, payload, {"x-goog-api-key": GEMINI_API_KEY})
-        except RuntimeError as exc:
-            last_error = exc
-            continue
-        candidates = body.get("candidates") or []
-        if not candidates:
-            last_error = RuntimeError(f"{model}: javob bo'sh (bloklangan?)")
-            continue
-        chunks = (candidates[0].get("content") or {}).get("parts") or []
-        text = "".join(str(chunk.get("text") or "") for chunk in chunks).strip()
-        if text:
-            return text
-        last_error = RuntimeError(f"{model}: matn qaytmadi")
-    raise last_error or RuntimeError("Gemini javob bermadi")
-
-
-async def _ai_ask_openai_compatible(url, api_key, model, prompt, image_b64="", mime="image/jpeg", extra_headers=None, timeout=45) -> str:
-    headers = {"Authorization": f"Bearer {api_key}"}
-    if extra_headers:
-        headers.update(extra_headers)
-    payload = {
-        "model": model,
-        "messages": _ai_openai_messages(prompt, image_b64, mime),
-        "temperature": 0.2,
-        "max_tokens": 900,
-    }
-    body = await _ai_post_json(url, payload, headers, timeout=timeout)
-    choices = body.get("choices") or []
-    if not choices:
-        raise RuntimeError("API bo'sh javob qaytardi")
-    message = choices[0].get("message") or {}
-    text = str(message.get("content") or "").strip()
-    if not text:
-        raise RuntimeError("API matn qaytarmadi")
-    return text
-
-
-async def _ai_ask_pollinations(prompt: str, image_b64: str = "", mime: str = "image/jpeg") -> str:
-    global _AI_POLL_DOWN_UNTIL
-    if time.monotonic() < _AI_POLL_DOWN_UNTIL:
-        raise RuntimeError("Pollinations hozircha band (limit)")
-    if image_b64:
-        raise RuntimeError("Pollinations anonim tarifi rasmni qo'llamaydi")
-    payload = {"model": AI_MODEL or "openai-fast", "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
-    headers = {"Referer": "https://kinora-bot.example"}
-    try:
-        body = await _ai_post_json(AI_API_URL, payload, headers, timeout=40)
-    except RuntimeError as exc:
-        match = re.search(r"Retry after (\d+)s", str(exc), flags=re.I)
-        if match:
-            _AI_POLL_DOWN_UNTIL = time.monotonic() + int(match.group(1)) + 2
-        elif "HTTP 429" in str(exc) or "HTTP 402" in str(exc):
-            _AI_POLL_DOWN_UNTIL = time.monotonic() + 47
-        raise
-    choices = body.get("choices") or []
-    if not choices:
-        raise RuntimeError("Pollinations bo'sh javob qaytardi")
-    message = choices[0].get("message") or {}
-    return str(message.get("content") or "")
-
-
-async def _ai_request(prompt: str, image_b64: str = "", mime: str = "image/jpeg") -> str:
-    """Provayderlar zanjiri: birinchisi ishlamasa, keyingisiga o'tadi."""
-    errors = []
-    for provider in _ai_provider_chain(bool(image_b64)):
-        try:
-            if provider == "gemini":
-                return await _ai_ask_gemini(prompt, image_b64, mime)
-            if provider == "groq":
-                return await _ai_ask_openai_compatible(
-                    "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, GROQ_MODEL, prompt, image_b64, mime)
-            if provider == "openrouter":
-                model = await _ai_openrouter_model(bool(image_b64))
-                return await _ai_ask_openai_compatible(
-                    "https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, model, prompt,
-                    image_b64, mime, {"HTTP-Referer": "https://kinora-bot.example", "X-Title": "KINO Bot AI"})
-            if provider == "custom":
-                return await _ai_ask_openai_compatible(AI_API_URL, AI_API_KEY, AI_MODEL or "openai-fast", prompt, image_b64, mime)
-            if provider == "pollinations":
-                return await _ai_ask_pollinations(prompt, image_b64, mime)
-        except Exception as exc:
-            errors.append(f"{provider}: {exc}")
-            logging.warning("AI provayderi %s ishlamadi: %s", provider, exc)
-    raise RuntimeError("; ".join(errors) or "AI provayderi sozlanmagan")
-
-
-def local_media_search(query: str, data, limit: int = 5) -> list:
-    """AI ishlamaganda nom/janr/tavsif bo'yicha oddiy o'xshashlik qidiruvi."""
-    norm_query = re.sub(r"[^a-z0-9а-яё]", "", query.casefold())
-    if len(norm_query) < 2:
-        return []
-    words = [w for w in re.findall(r"[a-z0-9а-яё]+", query.casefold()) if len(w) >= 3]
-    scored = []
-    for code, media in data.get("medias", {}).items():
-        if not media_available_for_user(0, media, data):
-            continue
-        name = str(media.get("name") or "")
-        folded = name.casefold()
-        norm_name = re.sub(r"[^a-z0-9а-яё]", "", folded)
-        score = difflib.SequenceMatcher(None, norm_query, norm_name).ratio()
-        haystack = " ".join([folded, str(media.get("genres") or "").casefold(), str(media.get("description") or "").casefold()])
-        if words and all(w in haystack for w in words):
-            score = max(score, 0.75)
-        elif any(w in haystack for w in words):
-            score = max(score, 0.5)
-        if query.casefold() in folded or (len(norm_query) >= 3 and score >= 0.45):
-            scored.append((score, str(code)))
-    scored.sort(key=lambda pair: -pair[0])
-    return [code for _score, code in scored[:limit]]
-
-
-def _ai_results_keyboard(codes: list) -> InlineKeyboardMarkup:
-    data = load_data()
-    icons = {"movie": "🎞", "series": "📺", "drama": "🎭", "anime": "🍥", "cartoon": "🎨"}
-    rows = []
-    for code in codes:
-        media = data.get("medias", {}).get(str(code))
-        if not media:
-            continue
-        icon = icons.get(media.get("media_type"), "🎬")
-        rows.append([InlineKeyboardButton(text=f"{icon} {media.get('name', 'Nomsiz')} · {code}", callback_data=f"show:{code}")])
-    rows.append([InlineKeyboardButton(text="🤖 Yana so'rash", callback_data="ai_mode")])
-    rows.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@dp.callback_query(F.data == "ai_mode")
-async def ai_mode_start(call: CallbackQuery, state: FSMContext):
-    data = load_data()
-    if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
-        return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
-    if not await enforce_subscription(call.from_user.id):
-        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
-        return await call.answer()
-    if not _ai_rate_ok(call.from_user.id):
-        return await call.answer("⏳ Biroz kuting, oldingi so'rovingiz qayta ishlanmoqda.", show_alert=True)
-    await state.set_state(Form.ai_query)
-    await call.message.answer(
-        "🤖 <b>AI rejimi</b>\n\n"
-        "Qidirayotgan anime, kino yoki multfilmingizni o'z so'zingiz bilan tasvirlab yozing "
-        "(masalan: «bola o'z oilasini qidiradigan anime»).\n\n"
-        "Yoki rasm/skrinshot yuboring — AI rasmni o'qib, bazadan mos kontentni topadi.\n"
-        "Bekor qilish: /cancel")
-    await call.answer()
-
-
-@dp.message(Form.ai_query)
-async def ai_query_handle(message: Message, state: FSMContext):
-    if not await require_subscription_message(message):
-        await state.clear()
-        return
-    text = (message.text or message.caption or "").strip()
-    photo = message.photo[-1] if message.photo else None
-    if not text and not photo:
-        return await message.answer("✍️ Kontentni so'z bilan tasvirlang yoki rasm yuboring. Bekor qilish: /cancel")
-    data = load_data()
-    catalog = _ai_catalog(data)
-    if not catalog:
-        await state.clear()
-        return await message.answer("📭 Botda hali kontent yo'q. Keyinroq urinib ko'ring.", reply_markup=main_menu(message.from_user.id))
-    valid_codes = {item["code"] for item in catalog}
-    prompt = _ai_prompt(catalog)
-    image_b64 = ""
-    if photo:
-        if not _ai_has_vision():
-            return await message.answer(
-                "🖼 Rasm bo'yicha qidiruv hozircha yoqilmagan. Kontentni so'z bilan tasvirlab yozing — bot bazadan topib beradi.\n\nBekor qilish: /cancel",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")],
-                ]))
-        try:
-            buffer = io.BytesIO()
-            await bot.download(photo.file_id, destination=buffer)
-            image_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
-        except Exception:
-            logging.exception("AI uchun rasm yuklab olinmadi")
-            await state.clear()
-            return await message.answer(
-                "🖼 Rasmni o'qib bo'lmadi. Iltimos, kontentni so'z bilan tasvirlab yozing:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🤖 AI rejimi", callback_data="ai_mode")]]))
-    full_prompt = prompt + "\n\nFoydalanuvchi so'rovi: " + (text or "rasmdagi kontent")
-    status = await message.answer("⏳ AI qidirmoqda, biroz kuting…")
-    reply_text = ""
-    try:
-        reply_text = await _ai_request(full_prompt, image_b64)
-        codes = _extract_ai_codes(reply_text, valid_codes) or _ai_guess_from_text(reply_text, catalog)
-    except Exception as exc:
-        logging.warning("AI so'rovi muvaffaqiyatsiz: %s", exc)
-        codes = []
-    fallback_used = False
-    if not codes and text:
-        codes = local_media_search(text, data)
-        fallback_used = bool(codes)
-    await state.clear()
-    try:
-        await status.delete()
-    except Exception:
-        pass
-    if not codes:
-        return await message.answer(
-            "❌ AI mos kontent topa olmadi.\n\n"
-            "Nomni boshqacha tasvirlab ko'ring yoki oddiy nom bo'yicha qidiruvdan foydalaning.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔎 Nom bo'yicha izlash", callback_data="search_name")],
-                [InlineKeyboardButton(text="🤖 Yana AI bilan", callback_data="ai_mode")],
-                [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")],
-            ]))
-    header = "🤖 <b>AI topdi:</b>"
-    if fallback_used:
-        header += "\n<i>AI javob bermadi — nom bo'yicha o'xshash natijalar ko'rsatildi.</i>"
-    await message.answer(f"{header}\nKerakli kontentni tanlang:", reply_markup=_ai_results_keyboard(codes))
 
 
 # ================= TOP KO'RILGANLAR =================
@@ -4038,6 +3648,212 @@ async def del_season_number(message: Message, state: FSMContext):
     save_data(data); await state.clear()
     await message.answer(f"🗑 {sn}-fasl va undagi {count} ta qism o‘chirildi.", reply_markup=admin_menu(message.from_user.id))
 
+
+# ================= VIP FASL / QISMLAR =================
+def parse_vip_numbers(raw: str) -> set:
+    """«1,3» yoki «2-5» ko'rinishidagi raqamlarni to'plamga aylantiradi."""
+    result = set()
+    for token in re.split(r"[,;\s]+", (raw or "").strip()):
+        if not token:
+            continue
+        if re.fullmatch(r"\d{1,4}", token):
+            result.add(int(token))
+        elif re.fullmatch(r"\d{1,4}-\d{1,4}", token):
+            start, end = (int(x) for x in token.split("-"))
+            if start > end:
+                start, end = end, start
+            if end - start > 200:
+                raise ValueError(token)
+            result.update(range(start, end + 1))
+        else:
+            raise ValueError(token)
+    return result
+
+
+def _numeric_keys(mapping) -> list:
+    return sorted(int(k) for k in (mapping or {}) if str(k).isdigit())
+
+
+@dp.callback_query(F.data == "vip_seasons_menu")
+async def vip_seasons_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Bu bo'lim faqat bot egasi uchun.", show_alert=True)
+    await state.set_state(Form.vip_mark_code)
+    await call.message.answer(
+        "💎 <b>VIP fasl / qismlar</b>\n\n"
+        "Qaysi kontentning fasl yoki qismlarini VIP qilmoqchisiz? Kodini yuboring.\n"
+        "Bekor qilish: /cancel")
+    await call.answer()
+
+
+@dp.message(Form.vip_mark_code)
+async def vip_mark_code_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+    code = (message.text or "").strip()
+    if code == "/cancel":
+        await state.clear()
+        return await message.answer("✅ Bekor qilindi.", reply_markup=owner_menu())
+    data = load_data()
+    media = data.get("medias", {}).get(code)
+    if not media:
+        return await message.answer("❌ Bu kod bo'yicha kontent topilmadi. Kodni qayta yuboring yoki /cancel:")
+    seasons = media.get("seasons") or {"1": {"episodes": media.get("episodes", {})}}
+    season_keys = sorted(seasons, key=lambda v: int(v) if str(v).isdigit() else 999999)
+    await state.update_data(vip_mark_code=code)
+    title = f"🎬 <b>{media.get('name', 'Kontent')}</b>"
+    if len(season_keys) == 1:
+        sn = season_keys[0]
+        season = seasons.get(sn) or {}
+        episodes = season.get("episodes") or {}
+        available = _numeric_keys(episodes)
+        vip_numbers = [str(n) for n in available if episode_is_vip(media, sn, n)]
+        status = "💎 VIP" if as_bool(season.get("vip"), False) else "🔓 oddiy"
+        info = f"📺 {sn}-fasl: {status}"
+        if vip_numbers and not as_bool(season.get("vip"), False):
+            info += f"\n💎 VIP qismlar: {', '.join(vip_numbers)}"
+        await state.set_state(Form.vip_mark_episodes)
+        return await message.answer(
+            f"{title}\n{info}\n\n"
+            f"Mavjud qismlar: {', '.join(str(n) for n in available) or 'hali qo‘shilmagan'}\n\n"
+            "Qaysi qismlar VIP bo'lsin? Raqamlarni vergul bilan yozing, masalan: <b>2,5,7-9</b>\n"
+            "• <b>hammasi</b> — butun fasl VIP\n"
+            "• <b>0</b> — VIP belgilarini olib tashlash\n"
+            "Bekor qilish: /cancel")
+    await state.set_state(Form.vip_mark_season)
+    lines = []
+    for sn in season_keys:
+        details = seasons.get(sn) or {}
+        mark = "💎 VIP" if as_bool(details.get("vip"), False) else "🔓 oddiy"
+        lines.append(f"• {sn}-fasl — {mark} ({len(details.get('episodes') or {})} qism)")
+    await message.answer(
+        f"{title}\n\n" + "\n".join(lines) +
+        "\n\nQaysi fasllar VIP bo'lsin? Raqamlarni vergul bilan yozing, masalan: <b>1,3</b>\n"
+        "Faqat sanab o'tilgan fasllar VIP bo'ladi, qolganlari oddiy qoladi.\n"
+        "• <b>0</b> — barcha VIP belgilarini olib tashlash\n"
+        "Bekor qilish: /cancel")
+
+
+@dp.message(Form.vip_mark_season)
+async def vip_mark_season_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if raw == "/cancel":
+        await state.clear()
+        return await message.answer("✅ Bekor qilindi.", reply_markup=owner_menu())
+    data = load_data()
+    saved = await state.get_data()
+    code = str(saved.get("vip_mark_code", ""))
+    media = data.get("medias", {}).get(code)
+    if not media:
+        await state.clear()
+        return await message.answer("❌ Kontent topilmadi.", reply_markup=owner_menu())
+    seasons = media.get("seasons") or {}
+    try:
+        numbers = parse_vip_numbers(raw)
+    except ValueError:
+        return await message.answer("🔢 Fasl raqamlarini vergul bilan yuboring, masalan 1,3. Yoki 0:")
+    if not numbers:
+        return await message.answer("🔢 Kamida bitta fasl raqamini yuboring yoki 0:")
+    if numbers == {0}:
+        for season in seasons.values():
+            if not isinstance(season, dict):
+                continue
+            season.pop("vip", None)
+            for record in (season.get("episodes") or {}).values():
+                if isinstance(record, dict):
+                    record.pop("vip", None)
+        save_data(data)
+        await state.clear()
+        return await message.answer("✅ Barcha VIP belgilari olib tashlandi.", reply_markup=owner_menu())
+    unknown = [str(n) for n in sorted(numbers) if str(n) not in seasons]
+    if unknown:
+        return await message.answer(f"❌ Bunday fasl yo'q: {', '.join(unknown)}. Qayta yuboring yoki /cancel:")
+    for sn, season in seasons.items():
+        if not isinstance(season, dict):
+            continue
+        if str(sn).isdigit() and int(sn) in numbers:
+            season["vip"] = True
+        else:
+            season.pop("vip", None)
+    save_data(data)
+    await state.clear()
+    summary = ", ".join(f"{sn}-fasl" for sn in sorted(seasons, key=lambda v: int(v) if str(v).isdigit() else 999999) if str(sn).isdigit() and int(sn) in numbers)
+    await message.answer(
+        f"✅ Saqlandi.\n💎 VIP: {summary}\n\nOddiy foydalanuvchilar bu fasllarni ko'ra olmaydi.",
+        reply_markup=owner_menu())
+
+
+@dp.message(Form.vip_mark_episodes)
+async def vip_mark_episodes_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if raw == "/cancel":
+        await state.clear()
+        return await message.answer("✅ Bekor qilindi.", reply_markup=owner_menu())
+    data = load_data()
+    saved = await state.get_data()
+    code = str(saved.get("vip_mark_code", ""))
+    media = data.get("medias", {}).get(code)
+    if not media:
+        await state.clear()
+        return await message.answer("❌ Kontent topilmadi.", reply_markup=owner_menu())
+    seasons = media.get("seasons") or {"1": {"episodes": media.get("episodes", {})}}
+    sn = sorted(seasons, key=lambda v: int(v) if str(v).isdigit() else 999999)[0]
+    season = seasons.get(sn) or {}
+    season.setdefault("episodes", {})
+    if raw.casefold() in {"hammasi", "all", "butun", "butun fasl"}:
+        season["vip"] = True
+        for record in season["episodes"].values():
+            if isinstance(record, dict):
+                record.pop("vip", None)
+        save_data(data)
+        await state.clear()
+        return await message.answer("✅ Butun fasl VIP qilindi.", reply_markup=owner_menu())
+    try:
+        numbers = parse_vip_numbers(raw)
+    except ValueError:
+        return await message.answer("🔢 Qism raqamlarini vergul bilan yuboring, masalan 2,5,7-9. Yoki hammasi / 0:")
+    if not numbers:
+        return await message.answer("🔢 Kamida bitta qism raqamini yuboring, hammasi yoki 0:")
+    if numbers == {0}:
+        season.pop("vip", None)
+        for record in season["episodes"].values():
+            if isinstance(record, dict):
+                record.pop("vip", None)
+        save_data(data)
+        await state.clear()
+        return await message.answer("✅ VIP belgilari olib tashlandi.", reply_markup=owner_menu())
+    available = set(_numeric_keys(season["episodes"]))
+    unknown = sorted(numbers - available)
+    if unknown:
+        listed = ", ".join(str(n) for n in sorted(available)) or "yo'q"
+        return await message.answer(
+            f"❌ Bunday qismlar hali qo'shilmagan: {', '.join(map(str, unknown))}.\n"
+            f"Mavjud qismlar: {listed}. Qayta yuboring yoki /cancel:")
+    # Muayyan qismlar tanlandi — demak butun fasl VIP emas.
+    season.pop("vip", None)
+    vip_numbers = []
+    for key, record in season["episodes"].items():
+        if not isinstance(record, dict) or not str(key).isdigit():
+            continue
+        if int(key) in numbers:
+            record["vip"] = True
+            vip_numbers.append(int(key))
+        else:
+            record.pop("vip", None)
+    save_data(data)
+    await state.clear()
+    await message.answer(
+        f"✅ Saqlandi.\n💎 VIP qismlar: {', '.join(str(n) for n in sorted(vip_numbers))}\n\n"
+        "Oddiy foydalanuvchilar bu qismlarni ko'ra olmaydi.",
+        reply_markup=owner_menu())
+
 @dp.callback_query(F.data == "rename_media")
 async def rename_start(call: CallbackQuery, state: FSMContext):
     await ask(call, state, Form.rename_code, "✏️ Nomi o'zgaradigan media kodini yuboring:")
@@ -4402,7 +4218,6 @@ EDITABLE_BUTTONS = {
     "referral": "👥 Referal",
     "topup": "💰 Balans to‘ldirish",
     "contact_admin": "📞 Admin bilan bog‘lanish",
-    "ai_mode": "🤖 AI rejimi",
     "top_viewed": "🔥 Top ko‘rilganlar",
     "search": "🔢 Kod bo‘yicha qidirish",
     "search_name": "🔠 Nom bo‘yicha qidirish",
@@ -4434,7 +4249,6 @@ BUTTON_EMOJI_GROUPS = [
         ("topup", "💰 Balans to'ldirish"),
         ("vip_buy", "💎 VIP olish"),
         ("vip_info", "❓ VIP o'zi nima?"),
-        ("ai_mode", "🤖 AI rejimi"),
         ("top_viewed", "🔥 Top ko'rilganlar"),
         ("order_new", "🛒 Buyurtma berish"),
         ("complaint_new", "📝 Shikoyat"),
