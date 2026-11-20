@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from html import escape as _esc
 from urllib.parse import quote
+import aiohttp
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
@@ -51,9 +53,18 @@ def _button_emoji_value(callback_data):
         return ""
 
 
+def _strip_leading_emoji(text):
+    """Tugma matni boshidagi eski emoji/simvollarni olib tashlaydi."""
+    original = str(text or "")
+    cleaned = re.sub(r"^[\W_]+", "", original, count=1)
+    return cleaned or original
+
+
 def _apply_button_emoji(button, value):
     if not value or not _CUSTOM_EMOJI_STATE["allowed"]:
         return button
+    # Yangi emoji eski emoji o'rniga qo'yiladi — ikkitasi qolib ketmaydi.
+    button.text = _strip_leading_emoji(button.text)
     if value.isdigit():
         # icon_custom_emoji_id premium emojini tugma oldiga qo'yadi.
         try:
@@ -153,6 +164,14 @@ else:
 DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
 BACKUP_CHANNEL_ID = os.getenv("BACKUP_CHANNEL_ID", "").strip()
 ADMIN_CONTACT = "@AnimBot_Admin"
+# To'lov kartasi: owner panelidagi sozlama bo'sh bo'lsa shu ENV qiymatlari ishlatiladi.
+PAYMENT_CARD_ENV = os.getenv("PAYMENT_CARD", "").strip()
+PAYMENT_CARD_HOLDER_ENV = os.getenv("PAYMENT_CARD_HOLDER", "").strip()
+PAYMENT_CARD_BANK_ENV = os.getenv("PAYMENT_CARD_BANK", "").strip()
+# AI rejimi: OpenAI-mos keluvchi bepul API (standart — Pollinations, kalit talab qilmaydi).
+AI_API_URL = os.getenv("AI_API_URL", "https://text.pollinations.ai/openai").strip()
+AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
+AI_MODEL = os.getenv("AI_MODEL", "openai").strip()
 # media postlari saqlanadigan kanal ID sini STORAGE_CHANNEL_ID environment variable orqali berish mumkin.
 CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "").strip()
 
@@ -264,9 +283,11 @@ def default_data():
         "banned_users": [],
         "orders": [],
         "complaints": [],
+        "payments": {},
+        "payment_seq": 0,
         "order_seq": 0,
         "complaint_seq": 0,
-        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "button_emojis": {}, "maintenance": False, "vip_enabled": False, "vip_save_protection": True, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "referral_need": 3, "referral_vip_days": 3, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
+        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "button_emojis": {}, "maintenance": False, "vip_enabled": False, "vip_save_protection": True, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "notify_new_content": True, "admin_contact": "obidov_xz", "payment_card_number": "", "payment_card_holder": "", "payment_card_bank": "", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
     }
 
 
@@ -302,6 +323,7 @@ def load_data():
         media.setdefault("status", "")
         media.setdefault("quality", "")
         media.setdefault("voice", "")
+        media.setdefault("views", 0)
     # Avvaldan saqlangan medialarni yangi qoida bo'yicha darhol ochiq qoldiramiz.
     for media in data.get("medias", {}).values():
         media.setdefault("created_at", 0)
@@ -439,9 +461,11 @@ def main_menu(user_id=None):
     rows = [
         [InlineKeyboardButton(text="🔎 Anime va Kino izlash", callback_data="search_menu")],
         [InlineKeyboardButton(text="👤 Hisobim", callback_data="account"), InlineKeyboardButton(text="👥 Referal", callback_data="referral")],
-        [InlineKeyboardButton(text="💰 Balans", callback_data="account"), InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
+        [InlineKeyboardButton(text="💰 Balans to‘ldirish", callback_data="topup"), InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
         [InlineKeyboardButton(text="❓ VIP o‘zi nima?", callback_data="vip_info")],
+        [InlineKeyboardButton(text="🤖 AI rejimi", callback_data="ai_mode"), InlineKeyboardButton(text="🔥 Top ko‘rilganlar", callback_data="top_viewed")],
         [InlineKeyboardButton(text="🛒 Buyurtma berish", callback_data="order_new"), InlineKeyboardButton(text="📝 Shikoyat", callback_data="complaint_new")],
+        [InlineKeyboardButton(text="📞 Admin bilan bog‘lanish", callback_data="contact_admin")],
         [InlineKeyboardButton(text="📖 Qo‘llanma", callback_data="guide")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -466,7 +490,7 @@ def admin_menu(user_id=None):
     if uid is not None and not is_owner(uid):
         perms = get_admin_permissions(uid)
     else:
-        perms = {"add_content", "add_episode", "edit_content", "delete_content"}
+        perms = {"add_content", "add_episode", "edit_content", "delete_content", "payments", "emoji"}
     rows = []
     if "add_content" in perms:
         rows.append([InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="newtype:movie"), InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="newtype:series")])
@@ -480,6 +504,11 @@ def admin_menu(user_id=None):
     if "delete_content" in perms:
         rows.append([InlineKeyboardButton(text="🗑 Kontent o'chirish", callback_data="del_media")])
         rows.append([InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode"), InlineKeyboardButton(text="🗑 Fasl o'chirish", callback_data="del_season")])
+    if "payments" in perms:
+        rows.append([InlineKeyboardButton(text="🧾 To'lovlar", callback_data="payments")])
+    if "emoji" in perms:
+        rows.append([InlineKeyboardButton(text="😀 Tugmalarga emoji qo'shish", callback_data="button_emoji_menu")])
+    rows.append([InlineKeyboardButton(text="📞 Admin bilan bog'lanish", callback_data="contact_admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows or [[InlineKeyboardButton(text="⛔ Sizga huquq berilmagan", callback_data="admin_home")]])
 
 
@@ -492,6 +521,8 @@ def owner_menu():
         [InlineKeyboardButton(text="✏️ Nom / kodni tahrirlash", callback_data="rename_media"), InlineKeyboardButton(text="🖼 Posterni tahrirlash", callback_data="edit_poster")],
         [InlineKeyboardButton(text="👤 Admin qo'shish", callback_data="add_admin"), InlineKeyboardButton(text="➖ Admin o'chirish", callback_data="del_admin")],
         [InlineKeyboardButton(text="🔐 Admin huquqlarini sozlash", callback_data="admin_permissions")],
+        [InlineKeyboardButton(text="🧾 To'lovlar", callback_data="payments"), InlineKeyboardButton(text="💳 To'lov kartasi", callback_data="payment_card_cfg")],
+        [InlineKeyboardButton(text="📞 Admin lichkasini o'zgartirish", callback_data="edit_admin_contact")],
         [InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="add_channel"), InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="del_channel")],
         [InlineKeyboardButton(text="🎨 Tugma ranglari", callback_data="appearance")],
         [InlineKeyboardButton(text="😀 Tugmalarga emoji qo'shish", callback_data="button_emoji_menu")],
@@ -681,6 +712,20 @@ def media_available_for_user(user_id: int, media: dict, data=None) -> bool:
     return True
 
 
+def record_view(code: str):
+    """Kontent necha marta ochilganini hisoblaydi (Top ko'rilganlar uchun)."""
+    try:
+        data = load_data()
+        item = data.get("medias", {}).get(str(code))
+        if not item:
+            return
+        item["views"] = int(item.get("views", 0) or 0) + 1
+        item["last_viewed_at"] = now_ts()
+        save_data(data)
+    except Exception:
+        logging.exception("Ko'rishlar sonini saqlashda xatolik")
+
+
 async def send_media_card(chat_id: int, code: str, media: dict):
     data = load_data()
     caption = media_caption(code, media)
@@ -694,6 +739,7 @@ async def send_media_card(chat_id: int, code: str, media: dict):
         await bot.send_photo(chat_id, poster, caption=caption, reply_markup=markup)
     else:
         await bot.send_message(chat_id, caption, reply_markup=markup)
+    record_view(code)
 
 
 class Form(StatesGroup):
@@ -728,6 +774,10 @@ class Form(StatesGroup):
     broadcast_message = State()
     button_text_value = State()
     button_emoji_value = State()
+    topup_amount = State()
+    topup_receipt = State()
+    payment_card_edit = State()
+    ai_query = State()
     edit_poster_code = State()
     edit_poster_file = State()
     admin_permissions_id = State()
@@ -907,19 +957,10 @@ async def purge_vip_media(user_id: int, user: dict) -> int:
 # ================= REFERAL TIZIMI =================
 REF_PREFIX = "ref_"
 REFERRAL_RULES = (
-    "• Har <b>{need} ta</b> do‘stingiz havola orqali botga kirsa — "
-    "<b>{vip_days} kunlik VIP</b> olasiz.\n"
+    "• Havolangiz orqali do‘stingiz botga kirsa, u sizning referalingiz bo‘ladi.\n"
     "• Referal faqat do‘stingiz <b>barcha majburiy kanallarga obuna bo‘lgandan keyin</b> hisoblanadi.\n"
-    "• VIP muddati tugagach, VIP orqali ochilgan kinolar chatdan o‘chiriladi."
+    "• Har bir do‘st faqat bir marta hisoblanadi."
 )
-
-
-def ref_settings(data=None):
-    data = data or load_data()
-    cfg = data.get("settings", {})
-    need = max(1, int(cfg.get("referral_need", 3) or 3))
-    vip_days = max(1, int(cfg.get("referral_vip_days", 3) or 3))
-    return need, vip_days
 
 
 def parse_ref_payload(payload: str):
@@ -982,28 +1023,19 @@ async def _credit_referral(user_id: int) -> bool:
         return False
     user["referral_qualified"] = True
     user["referral_qualified_at"] = now_ts()
-    need, vip_days = ref_settings(data)
     count = int(inviter.get("referrals_count", 0) or 0) + 1
     inviter["referrals_count"] = count
-    reward_given = count % need == 0
-    if reward_given:
-        base = max(now_ts(), vip_until_ts(inviter))
-        inviter["vip_until"] = base + vip_days * 86400
-        inviter["referral_rewards"] = int(inviter.get("referral_rewards", 0) or 0) + 1
-        inviter.pop("vip_warned_until", None)
     save_data(data)
     logging.info("Referal hisoblandi: user=%s referrer=%s count=%s", user_id, referrer_key, count)
-    if reward_given:
-        try:
-            await bot.send_message(
-                int(referrer_key),
-                "🎉 <b>Tabriklaymiz!</b>\n\n"
-                f"👥 Taklif qilgan do‘stlaringiz: <b>{count}</b> ta\n"
-                f"💎 Mukofot: <b>{vip_days} kunlik VIP</b>\n"
-                f"⏳ VIP tugash vaqti: <b>{fmt_date(inviter['vip_until'])}</b>",
-            )
-        except Exception:
-            logging.info("Referal mukofoti xabari yuborilmadi: %s", referrer_key)
+    try:
+        await bot.send_message(
+            int(referrer_key),
+            "👥 <b>Yangi referal</b>\n\n"
+            "Do‘stingiz havolangiz orqali botga qo‘shildi.\n"
+            f"📊 Jami taklif qilgan do‘stlaringiz: <b>{count}</b> ta",
+        )
+    except Exception:
+        logging.info("Referal xabari yuborilmadi: %s", referrer_key)
     return True
 
 
@@ -1011,9 +1043,6 @@ async def referral_text_and_link(user_id: int):
     data = load_data()
     user = data.get("users", {}).get(str(user_id), {})
     count = int(user.get("referrals_count", 0) or 0)
-    need, vip_days = ref_settings(data)
-    left = need - (count % need)
-    rewards = int(user.get("referral_rewards", 0) or 0)
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start={REF_PREFIX}{user_id}"
     text = (
@@ -1021,11 +1050,9 @@ async def referral_text_and_link(user_id: int):
         "🔗 Sizning taklif havolangiz:\n"
         f"<code>{link}</code>\n\n"
         "📋 <b>Qoidalar:</b>\n"
-        + REFERRAL_RULES.format(need=need, vip_days=vip_days)
+        + REFERRAL_RULES
         + "\n\n"
-        f"📊 Taklif qilgan do‘stlar: <b>{count}</b> ta\n"
-        f"🎁 Keyingi mukofotgacha: <b>{left}</b> ta do‘st\n"
-        f"👑 Olingan VIP mukofotlar: <b>{rewards}</b> marta"
+        f"📊 Taklif qilgan do‘stlar: <b>{count}</b> ta"
     )
     return text, link
 
@@ -1114,13 +1141,12 @@ async def owner_settings_callback(call: CallbackQuery):
         return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     cfg = load_data().get("settings", {})
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"👥 Referal: {cfg.get('referral_need', 3)} do‘st", callback_data="setcfg:referral_need")],
-        [InlineKeyboardButton(text=f"🎁 Referal mukofoti: {cfg.get('referral_vip_days', 3)} kunlik VIP", callback_data="setcfg:referral_vip_days")],
         [InlineKeyboardButton(text=f"👑 VIP 1 oy narxi: {cfg.get('vip_month_price', 15000)} so‘m", callback_data="setcfg:vip_month_price")],
         [InlineKeyboardButton(text=f"📅 VIP maksimal muddati: {cfg.get('vip_max_months', 6)} oy", callback_data="setcfg:vip_max_months")],
         [InlineKeyboardButton(text=f"⏳ VIP oy davomiyligi: {cfg.get('vip_duration_days', 30)} kun", callback_data="setcfg:vip_duration_days")],
         [InlineKeyboardButton(text=f"🎬 Erta ko‘rish: {cfg.get('early_view_days', 1)} kun", callback_data="setcfg:early_view_days")],
-        [InlineKeyboardButton(text=f"💬 To‘lov admini: @{str(cfg.get('admin_contact', 'obidov_xz')).lstrip('@')}", callback_data="setcfg:admin_contact")],
+        [InlineKeyboardButton(text=f"📞 Admin lichkasi: @{str(cfg.get('admin_contact', 'obidov_xz')).lstrip('@')}", callback_data="setcfg:admin_contact")],
+        [InlineKeyboardButton(text="💳 To‘lov kartasi", callback_data="payment_card_cfg")],
         [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
     ])
     try:
@@ -1136,10 +1162,8 @@ async def owner_setting_start(call: CallbackQuery, state: FSMContext):
         return await call.answer("⛔ Faqat owner uchun", show_alert=True)
     key = call.data.split(":", 1)[1]
     prompts = {
-        "admin_contact": "To‘lov adminining username sini yuboring, masalan @obidov_xz:",
+        "admin_contact": "Admin bilan bog'lanish uchun username yuboring, masalan @AnimBot_Admin:",
         "vip_month_price": "VIP obunasining 1 oylik narxini so‘mda yuboring:",
-        "referral_need": "Nechta do‘st taklif qilinganda mukofot berilsin (masalan, 3):",
-        "referral_vip_days": "Referal mukofoti necha kunlik VIP bo‘lsin (masalan, 3):",
         "vip_max_months": "VIP uchun ruxsat etilgan maksimal oy sonini yuboring:",
         "vip_duration_days": "VIP obunasining bir oyi necha kun bo‘lishini yuboring:",
         "early_view_days": "VIP erta ko‘rish necha kun oldin bo‘lishini yuboring:",
@@ -1176,11 +1200,11 @@ async def owner_setting_save(message: Message, state: FSMContext):
         value = raw
         if not value.startswith("@") or len(value) < 2 or " " in value:
             return await message.answer("⚠️ Username @ bilan boshlansin, masalan @AnimBot_Admin. Qayta yuboring:")
-    elif key in {"vip_max_months", "vip_duration_days", "early_view_days", "vip_month_price", "referral_need", "referral_vip_days"}:
+    elif key in {"vip_max_months", "vip_duration_days", "early_view_days", "vip_month_price"}:
         try: value = int(raw)
         except ValueError: return await message.answer("🔢 Faqat raqam yuboring:")
         if value < 0: return await message.answer("⚠️ Qiymat manfiy bo‘lishi mumkin emas:")
-        if key in {"vip_max_months", "vip_duration_days", "referral_need", "referral_vip_days"} and value < 1:
+        if key in {"vip_max_months", "vip_duration_days"} and value < 1:
             return await message.answer("⚠️ Bu qiymat kamida 1 bo‘lishi kerak:")
     else:
         await state.clear()
@@ -1189,8 +1213,473 @@ async def owner_setting_save(message: Message, state: FSMContext):
     data.setdefault("settings", {})[key] = value
     save_data(data)
     await state.clear()
-    labels = {"admin_contact": "To‘lov admini", "vip_month_price": "VIP oylik narxi", "referral_need": "Referal uchun kerakli do‘stlar soni", "referral_vip_days": "Referal mukofoti (kun)", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish"}
+    labels = {"admin_contact": "Admin lichkasi", "vip_month_price": "VIP oylik narxi", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish"}
     await message.answer(f"✅ {labels.get(key, key)} yangilandi: <b>{value}</b>\nO‘zgarish darhol kuchga kirdi.", reply_markup=owner_menu())
+
+
+def admin_contact_username(data=None):
+    """Admin bilan bog'lanish uchun username (@ siz)."""
+    data = data if data is not None else load_data()
+    raw = str(data.get("settings", {}).get("admin_contact") or ADMIN_CONTACT or "").strip()
+    return raw.lstrip("@").strip()
+
+
+@dp.callback_query(F.data == "contact_admin")
+async def contact_admin(call: CallbackQuery):
+    username = admin_contact_username()
+    if not username:
+        text = "📞 <b>Admin bilan bog‘lanish</b>\n\nHozircha aloqa username sozlanmagan."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
+    else:
+        text = ("📞 <b>Admin bilan bog‘lanish</b>\n\n"
+                f"💬 Admin: <b>@{_esc(username)}</b>\n\n"
+                "Savol, to‘lov yoki muammo bo‘lsa, quyidagi tugma orqali yozing.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Adminga yozish", url=f"https://t.me/{username}")],
+            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
+        ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "edit_admin_contact")
+async def edit_admin_contact_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    current = admin_contact_username() or "sozlanmagan"
+    await state.set_state(Form.owner_setting_value)
+    await state.update_data(setting_key="admin_contact")
+    await call.message.answer(
+        f"📞 <b>Admin lichkasi</b>\n\nHozirgi username: <b>@{_esc(current)}</b>\n\n"
+        "Yangi username yuboring (@ bilan), masalan <code>@AnimBot_Admin</code>.\n"
+        "Bu lichka asosiy menyudagi «📞 Admin bilan bog‘lanish» tugmasida ko‘rinadi.\n"
+        "Bekor qilish: /cancel")
+    await call.answer()
+
+
+# ================= BALANS TO'LDIRISH =================
+TOPUP_MIN = 1000
+TOPUP_MAX = 50_000_000
+
+
+def payment_card_info(data=None):
+    """Karta ma'lumotlari: avval owner panel sozlamasi, bo'sh bo'lsa ENV."""
+    data = data if data is not None else load_data()
+    cfg = data.get("settings", {})
+    number = str(cfg.get("payment_card_number") or PAYMENT_CARD_ENV or "").strip()
+    holder = str(cfg.get("payment_card_holder") or PAYMENT_CARD_HOLDER_ENV or "").strip()
+    bank = str(cfg.get("payment_card_bank") or PAYMENT_CARD_BANK_ENV or "").strip()
+    return number, holder, bank
+
+
+def format_card_number(number) -> str:
+    digits = re.sub(r"\D", "", str(number))
+    if not digits:
+        return str(number or "")
+    return " ".join(digits[i:i + 4] for i in range(0, len(digits), 4))
+
+
+def pay_money(value) -> str:
+    try:
+        return f"{int(float(value or 0)):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return "0"
+
+
+def can_review_payments(user_id: int) -> bool:
+    return has_permission(user_id, "payments")
+
+
+def payment_reviewers(data=None):
+    """Chek boradigan adminlar: ega + 'payments' huquqi bor adminlar."""
+    data = data if data is not None else load_data()
+    ids = {int(OWNER_ID)} if OWNER_ID else set()
+    for raw in list(ADMIN_IDS) + list(data.get("admins", [])):
+        try:
+            uid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if uid and can_review_payments(uid):
+            ids.add(uid)
+    return {uid for uid in ids if uid}
+
+
+def payment_card_panel_text() -> str:
+    number, holder, bank = payment_card_info()
+    lines = ["💳 <b>To‘lov kartasi sozlamalari</b>", ""]
+    lines.append(f"💳 Karta raqami: <code>{format_card_number(number)}</code>" if number else "💳 Karta raqami: <b>kiritilmagan</b>")
+    lines.append(f"👤 Karta egasi: <b>{_esc(holder)}</b>" if holder else "👤 Karta egasi: <b>kiritilmagan</b>")
+    lines.append(f"🏦 Bank: <b>{_esc(bank)}</b>" if bank else "🏦 Bank: <b>kiritilmagan</b>")
+    lines += ["", "Bu ma’lumot «💰 Balans to‘ldirish» bo‘limida foydalanuvchilarga ko‘rsatiladi.",
+              "Karta raqamini faqat siz (owner) o‘zgartirasiz."]
+    return "\n".join(lines)
+
+
+def payment_card_panel_kb():
+    number, holder, bank = payment_card_info()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Karta raqami: {format_card_number(number) or 'kiritish'}", callback_data="paycfg:number")],
+        [InlineKeyboardButton(text=f"👤 Karta egasi: {holder or 'kiritish'}", callback_data="paycfg:holder")],
+        [InlineKeyboardButton(text=f"🏦 Bank: {bank or 'kiritish'}", callback_data="paycfg:bank")],
+        [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")],
+    ])
+
+
+def payment_status_line(pay: dict) -> str:
+    status = pay.get("status")
+    if status == "approved":
+        reviewer = pay.get("reviewed_by") or "-"
+        when = fmt_date(int(pay.get("reviewed_at") or 0)) if pay.get("reviewed_at") else ""
+        return f"✅ <b>TASDIQLANDI</b> · admin <code>{reviewer}</code>" + (f" · {when}" if when else "")
+    if status == "rejected":
+        return f"❌ <b>RAD ETILDI</b> · admin <code>{pay.get('reviewed_by') or '-'}</code>"
+    return ""
+
+
+def payment_review_text(pay: dict) -> str:
+    username = f"@{pay['username']}" if pay.get("username") else "username yo'q"
+    number, _holder, _bank = payment_card_info()
+    lines = [
+        f"🧾 <b>To‘lov cheki #{pay.get('id')}</b>",
+        "",
+        f"👤 {_esc(str(pay.get('name') or '-'))} · {_esc(username)}",
+        f"🆔 <code>{pay.get('uid')}</code>",
+        f"💰 Summa: <b>{pay_money(pay.get('amount'))} so‘m</b>",
+        f"🕒 {fmt_date(int(pay.get('at') or 0))}",
+    ]
+    if number:
+        lines.append(f"💳 Karta: <code>{format_card_number(number)}</code>")
+    status_line = payment_status_line(pay)
+    if status_line:
+        lines += ["", status_line]
+    else:
+        lines += ["", "Chekni tekshiring: to‘lov haqiqiy bo‘lsa tasdiqlang."]
+    return "\n".join(lines)
+
+
+def payment_review_kb(pay: dict):
+    if pay.get("status") != "pending":
+        return None
+    pid = pay.get("id")
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"pay:approve:{pid}"),
+        InlineKeyboardButton(text="❌ Rad etish", callback_data=f"pay:reject:{pid}"),
+    ]])
+
+
+async def notify_payment_reviewers(payment: dict, data: dict):
+    caption = payment_review_text(payment)
+    kb = payment_review_kb(payment)
+    store = data.setdefault("payments", {}).get(str(payment.get("id")))
+    for admin_id in payment_reviewers(data):
+        sent = None
+        try:
+            sent = await bot.copy_message(
+                chat_id=admin_id, from_chat_id=payment["chat_id"],
+                message_id=payment["message_id"], caption=caption, reply_markup=kb)
+        except Exception as exc:
+            logging.info("Chek #%s %s ga nusxalanmadi: %s", payment.get("id"), admin_id, exc)
+            try:
+                sent = await bot.send_message(admin_id, caption, reply_markup=kb)
+            except Exception as exc2:
+                logging.info("Chek #%s %s ga yuborilmadi: %s", payment.get("id"), admin_id, exc2)
+        if sent is not None and store is not None:
+            store.setdefault("admin_msgs", {})[str(admin_id)] = sent.message_id
+    save_data(data)
+
+
+@dp.callback_query(F.data == "topup")
+async def topup_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    data = load_data()
+    user = data.get("users", {}).get(str(call.from_user.id), {})
+    balance = float(user.get("balance", 0) or 0)
+    number, holder, bank = payment_card_info(data)
+    lines = ["💰 <b>Balans to‘ldirish</b>", "", f"💳 Joriy balans: <b>{pay_money(balance)} so‘m</b>", ""]
+    if not number:
+        admin_contact = str(data.get("settings", {}).get("admin_contact") or ADMIN_CONTACT).lstrip("@")
+        lines += ["⚠️ To‘lov kartasi hali sozlanmagan.", f"Karta ma’lumotini admin: @{admin_contact} dan oling."]
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
+    else:
+        lines += ["To‘lovni quyidagi kartaga o‘tkazing:", f"💳 Karta: <code>{format_card_number(number)}</code>"]
+        if holder:
+            lines.append(f"👤 Karta egasi: <b>{_esc(holder)}</b>")
+        if bank:
+            lines.append(f"🏦 Bank: {_esc(bank)}")
+        lines += ["",
+                  "To‘lovdan keyin «✅ To‘lov qildim» tugmasini bosing.",
+                  "So‘ralgan summani yozing va chekni rasm yoki PDF qilib yuboring.",
+                  "Chek adminlar tasdiqlagach, summa avtomatik balansingizga qo‘shiladi."]
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ To‘lov qildim", callback_data="topup:amount")],
+            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
+        ])
+    text = "\n".join(lines)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "topup:amount")
+async def topup_amount_start(call: CallbackQuery, state: FSMContext):
+    number, _holder, _bank = payment_card_info()
+    if not number:
+        return await call.answer("⚠️ To‘lov kartasi sozlanmagan. Admin bilan bog‘laning.", show_alert=True)
+    await state.clear()
+    await state.set_state(Form.topup_amount)
+    await call.message.answer(
+        f"💰 To‘lov summasini so‘mda yuboring (masalan, 50000).\n"
+        f"Eng kam: {pay_money(TOPUP_MIN)} so‘m.\nBekor qilish: /cancel")
+    await call.answer()
+
+
+@dp.message(Form.topup_amount)
+async def topup_amount_save(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=main_menu(message.from_user.id))
+    cleaned = re.sub(r"[\s,_.]", "", text)
+    if not cleaned.isdigit():
+        return await message.answer("💰 Summani faqat raqamda yuboring (masalan, 50000). Bekor qilish: /cancel")
+    amount = int(cleaned)
+    if amount < TOPUP_MIN:
+        return await message.answer(f"⚠️ Eng kam summa {pay_money(TOPUP_MIN)} so‘m. Qayta yuboring:")
+    if amount > TOPUP_MAX:
+        return await message.answer(f"⚠️ Eng katta summa {pay_money(TOPUP_MAX)} so‘m. Qayta yuboring:")
+    await state.update_data(topup_amount=amount)
+    await state.set_state(Form.topup_receipt)
+    await message.answer(
+        f"🧾 Summa: <b>{pay_money(amount)} so‘m</b>\n\n"
+        "Endi to‘lov chekini yuboring — rasm yoki PDF fayl ko‘rinishida.\n"
+        "Bekor qilish: /cancel")
+
+
+@dp.message(Form.topup_receipt)
+async def topup_receipt_save(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "/cancel":
+        await state.clear()
+        return await message.answer("❎ Bekor qilindi.", reply_markup=main_menu(message.from_user.id))
+    file_type, file_id = "", ""
+    if message.photo:
+        file_type, file_id = "photo", message.photo[-1].file_id
+    elif message.document:
+        mime = (message.document.mime_type or "").lower()
+        if mime == "application/pdf" or mime.startswith("image/"):
+            file_type, file_id = "document", message.document.file_id
+        else:
+            return await message.answer("❌ Faqat rasm yoki PDF fayl qabul qilinadi. Chekni qayta yuboring. Bekor qilish: /cancel")
+    else:
+        return await message.answer("🖼 Chekni rasm yoki PDF fayl qilib yuboring. Bekor qilish: /cancel")
+    ctx = await state.get_data()
+    try:
+        amount = int(ctx.get("topup_amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    if amount <= 0:
+        await state.clear()
+        return await message.answer("❌ Summa topilmadi. «💰 Balans to‘ldirish» dan qaytadan boshlang.", reply_markup=main_menu(message.from_user.id))
+    data = load_data()
+    data["payment_seq"] = int(data.get("payment_seq", 0) or 0) + 1
+    pid = int(data["payment_seq"])
+    payment = {
+        "id": pid,
+        "uid": message.from_user.id,
+        "name": message.from_user.full_name,
+        "username": message.from_user.username or "",
+        "amount": amount,
+        "file_type": file_type,
+        "file_id": file_id,
+        "chat_id": message.chat.id,
+        "message_id": message.message_id,
+        "at": now_ts(),
+        "status": "pending",
+        "reviewed_by": 0,
+        "reviewed_at": 0,
+        "admin_msgs": {},
+    }
+    data.setdefault("payments", {})[str(pid)] = payment
+    save_data(data)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Chek qabul qilindi</b>\n\n🔖 Raqam: <b>#{pid}</b>\n"
+        f"💰 Summa: <b>{pay_money(amount)} so‘m</b>\n\n"
+        "Adminlar tekshirgach, tasdiqlangani haqida xabar beramiz.",
+        reply_markup=main_menu(message.from_user.id))
+    await notify_payment_reviewers(payment, data)
+
+
+@dp.callback_query(F.data.startswith(("pay:approve:", "pay:reject:")))
+async def payment_review(call: CallbackQuery):
+    if not can_review_payments(call.from_user.id):
+        return await call.answer("⛔ Sizda to‘lovlarni tasdiqlash huquqi yo‘q.", show_alert=True)
+    try:
+        _, action, pid = call.data.split(":", 2)
+    except ValueError:
+        return await call.answer()
+    data = load_data()
+    pay = data.setdefault("payments", {}).get(str(pid))
+    if not pay:
+        return await call.answer("⚠️ Chek topilmadi.", show_alert=True)
+    if pay.get("status") != "pending":
+        return await call.answer("ℹ️ Bu chek allaqachon ko‘rib chiqilgan.", show_alert=True)
+    user = data.setdefault("users", {}).setdefault(str(pay.get("uid")), {"id": pay.get("uid")})
+    balance = float(user.get("balance", 0) or 0)
+    if action == "approve":
+        balance += float(pay.get("amount") or 0)
+        user["balance"] = balance
+        pay["status"] = "approved"
+        result_text = "✅ Tasdiqlandi"
+    else:
+        pay["status"] = "rejected"
+        result_text = "❌ Rad etildi"
+    pay["reviewed_by"] = call.from_user.id
+    pay["reviewed_at"] = now_ts()
+    save_data(data)
+    await call.answer(result_text)
+    admin_text = payment_review_text(pay)
+    for chat_raw, msg_id in (pay.get("admin_msgs") or {}).items():
+        try:
+            chat_id = int(chat_raw)
+            await bot.edit_message_caption(chat_id=chat_id, message_id=int(msg_id),
+                                           caption=admin_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+        except Exception:
+            try:
+                await bot.edit_message_text(admin_text, chat_id=int(chat_raw), message_id=int(msg_id),
+                                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+            except Exception:
+                pass
+    if action == "approve":
+        user_text = (f"✅ <b>To‘lov tasdiqlandi</b>\n\n🔖 Chek: <b>#{pay.get('id')}</b>\n"
+                     f"💰 Qo‘shildi: <b>{pay_money(pay.get('amount'))} so‘m</b>\n"
+                     f"💳 Balansingiz: <b>{pay_money(balance)} so‘m</b>")
+    else:
+        user_text = (f"❌ <b>To‘lov rad etildi</b>\n\n🔖 Chek: <b>#{pay.get('id')}</b>\n"
+                     "Savollaringiz bo‘lsa, admin bilan bog‘laning.")
+    try:
+        await bot.send_message(int(pay.get("uid")), user_text, reply_markup=main_menu(int(pay.get("uid"))))
+    except Exception:
+        logging.info("To‘lov natijasi foydalanuvchiga yuborilmadi: %s", pay.get("uid"))
+
+
+@dp.callback_query(F.data == "payments")
+async def payments_list(call: CallbackQuery):
+    if not can_review_payments(call.from_user.id):
+        return await call.answer("⛔ Sizda to‘lovlarni ko‘rish huquqi yo‘q.", show_alert=True)
+    data = load_data()
+    items = sorted(data.get("payments", {}).values(), key=lambda p: int(p.get("id", 0) or 0))
+    pending = [p for p in items if p.get("status") == "pending"]
+    finished = [p for p in items if p.get("status") != "pending"][-5:]
+    blocks = []
+    for p in pending[-10:]:
+        blocks.append(f"🕓 #{p.get('id')} · {pay_money(p.get('amount'))} so‘m\n"
+                      f"👤 {_esc(str(p.get('name') or '-'))} · 🆔 <code>{p.get('uid')}</code>")
+    for p in finished:
+        mark = "✅" if p.get("status") == "approved" else "❌"
+        blocks.append(f"{mark} #{p.get('id')} · {pay_money(p.get('amount'))} so‘m · "
+                      f"👤 <code>{p.get('uid')}</code>")
+    rows = [[InlineKeyboardButton(text=f"🧾 #{p.get('id')} · {pay_money(p.get('amount'))} so‘m",
+                                  callback_data=f"pay:view:{p.get('id')}")] for p in pending[-10:]]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin_home")])
+    text = (f"🧾 <b>To‘lovlar</b>\n\nKutilayotgan cheklar: <b>{len(pending)}</b> ta"
+            + (("\n\n" + "\n\n".join(blocks)) if blocks else "\n\nHozircha to‘lov cheklari yo‘q."))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pay:view:"))
+async def payment_view(call: CallbackQuery):
+    if not can_review_payments(call.from_user.id):
+        return await call.answer("⛔ Sizda to‘lovlarni ko‘rish huquqi yo‘q.", show_alert=True)
+    pid = call.data.split(":", 2)[2]
+    data = load_data()
+    pay = data.setdefault("payments", {}).get(str(pid))
+    if not pay:
+        return await call.answer("⚠️ Chek topilmadi.", show_alert=True)
+    text = payment_review_text(pay)
+    kb = payment_review_kb(pay)
+    if kb:
+        kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ To‘lovlar", callback_data="payments")])
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ To‘lovlar", callback_data="payments")]])
+    try:
+        await bot.copy_message(chat_id=call.from_user.id, from_chat_id=pay["chat_id"],
+                               message_id=pay["message_id"], caption=text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "payment_card_cfg")
+async def payment_card_cfg(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    text = payment_card_panel_text()
+    kb = payment_card_panel_kb()
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("paycfg:"))
+async def payment_card_field_start(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    field = call.data.split(":", 1)[1]
+    prompts = {
+        "number": "💳 Karta raqamini yuboring (16 raqam, masalan 8600 1234 5678 9012):",
+        "holder": "👤 Karta egasining ism-familiyasini yuboring:",
+        "bank": "🏦 Bank nomini yuboring (masalan, Uzcard / Humo / Kapitalbank):",
+    }
+    if field not in prompts:
+        return await call.answer("⚠️ Noma’lum maydon", show_alert=True)
+    await state.update_data(payment_card_field=field)
+    await state.set_state(Form.payment_card_edit)
+    await call.message.answer(prompts[field] + "\nBekor qilish: /cancel")
+    await call.answer()
+
+
+@dp.message(Form.payment_card_edit)
+async def payment_card_field_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Faqat owner uchun.")
+    raw = (message.text or "").strip()
+    if raw == "/cancel":
+        await state.clear()
+        return await message.answer("✅ Bekor qilindi.", reply_markup=owner_menu())
+    ctx = await state.get_data()
+    field = ctx.get("payment_card_field")
+    setting_key = {"number": "payment_card_number", "holder": "payment_card_holder", "bank": "payment_card_bank"}.get(field)
+    if not setting_key:
+        await state.clear()
+        return await message.answer("❌ Maydon topilmadi.")
+    if field == "number":
+        digits = re.sub(r"\D", "", raw)
+        if not 12 <= len(digits) <= 19:
+            return await message.answer("⚠️ Karta raqami 12–19 raqamdan iborat bo‘lsin. Qayta yuboring:")
+        value = digits
+    else:
+        value = raw[:64]
+        if len(value) < 2:
+            return await message.answer("⚠️ Kamida 2 harf yozing. Qayta yuboring:")
+    data = load_data()
+    data.setdefault("settings", {})[setting_key] = value
+    save_data(data)
+    await state.clear()
+    await message.answer("✅ Saqlandi.\n\n" + payment_card_panel_text(), reply_markup=payment_card_panel_kb())
 
 
 @dp.callback_query(F.data == "manage_users")
@@ -1921,7 +2410,7 @@ async def guide(call: CallbackQuery):
         "4️⃣ Serial bo‘lsa, kerakli faslni, keyin qism raqamini bosing.\n"
         "5️⃣ Qism ochilgach, pastdagi ⬅️ va ➡️ tugmalari bilan oldingi yoki keyingi qismga o‘ting.\n\n"
         "🔒 Agar bot majburiy kanalga obuna bo‘lishni so‘rasa, kanallarga qo‘shiling va «Obunani tekshirish»ni bosing.\n"
-        "👥 Do‘stlaringizni taklif qiling: har 3 ta do‘st uchun 3 kunlik VIP olasiz — /ref buyrug‘i orqali havolangizni oling.\n"
+        "👥 Do‘stlaringizni taklif qiling: /ref buyrug‘i orqali havolangizni olib, do‘stlaringiz bilan ulashing.\n"
         "💎 Saqlash himoyasi yoqilganida VIP bo‘lmaganlar yuborilgan videoni Telegram orqali saqlay yoki boshqa joyga uzata olmaydi. VIP foydalanuvchilarga bu cheklov qo‘yilmaydi."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2429,6 +2918,266 @@ async def show_media(call: CallbackQuery):
     item = data["medias"][code]
     await send_media_card(call.from_user.id, code, item)
     # Faqat poster va mavjud qismlar tugmalari ko'rsatiladi; qism avtomatik yuborilmaydi.
+    await call.answer()
+
+
+# ================= AI REJIMI =================
+# Bepul OpenAI-mos API (standart: Pollinations) orqali tavsif yoki rasm bo'yicha
+# bot bazasidan mos anime/kino/multfilmni topadi. API ishlamasa — lokal qidiruv.
+_AI_LAST_REQUEST = {}
+
+
+def _ai_rate_ok(user_id: int) -> bool:
+    now = time.time()
+    last = float(_AI_LAST_REQUEST.get(int(user_id), 0) or 0)
+    if now - last < 3:
+        return False
+    _AI_LAST_REQUEST[int(user_id)] = now
+    return True
+
+
+def _ai_catalog(data) -> list:
+    items = []
+    for code, media in data.get("medias", {}).items():
+        if not media_available_for_user(0, media, data):
+            continue
+        items.append({
+            "code": str(code),
+            "name": str(media.get("name") or ""),
+            "type": str(media.get("media_type") or "series"),
+            "genres": str(media.get("genres") or ""),
+            "description": str(media.get("description") or ""),
+        })
+    return items
+
+
+def _ai_prompt(catalog: list) -> str:
+    lines = []
+    for item in catalog[:150]:
+        extra = ", ".join(x for x in (item["genres"], item["description"][:80]) if x)
+        label = {"movie": "kino", "series": "serial", "anime": "anime", "cartoon": "multfilm", "drama": "drama"}.get(item["type"], "kontent")
+        lines.append(f"- kod {item['code']} | {label} | {item['name']}" + (f" | {extra}" if extra else ""))
+    return (
+        "Sen kino va anime botining yordamchisisan. Foydalanuvchi kontentni so'z bilan "
+        "tasvirlaydi yoki rasm yuboradi. Quyidagi bazadan eng mos 1-5 ta kontentni tanla.\n"
+        "Faqat JSON qaytar: {\"codes\": [\"kod1\", \"kod2\"], \"reason\": \"qisqa izoh\"}.\n"
+        "Agar mos kontent bo'lmasa: {\"codes\": [], \"reason\": \"sabab\"}.\n\n"
+        "Baza:\n" + "\n".join(lines)
+    )
+
+
+def _extract_ai_codes(reply: str, valid_codes: set) -> list:
+    text = str(reply or "")
+    data = None
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+        except (ValueError, TypeError):
+            data = None
+    found = []
+    if isinstance(data, dict):
+        for raw in data.get("codes", []) or []:
+            code = str(raw).strip()
+            if code in valid_codes and code not in found:
+                found.append(code)
+    if not found:
+        # JSON buzilgan bo'lsa, javobdagi mavjud kodlarni qidiramiz.
+        for raw in re.findall(r"\b\d{1,7}\b", text):
+            if raw in valid_codes and raw not in found:
+                found.append(raw)
+    return found[:5]
+
+
+def _ai_guess_from_text(reply: str, catalog: list, limit: int = 5) -> list:
+    """AI kod o'rniga nom qaytarsa, nomlarni bazadagi kontentga moslaydi."""
+    text = str(reply or "").casefold()
+    scored = []
+    for item in catalog:
+        name = item["name"].casefold()
+        if len(name) >= 3 and name in text:
+            scored.append(item["code"])
+        if len(scored) >= limit:
+            break
+    return scored
+
+
+async def _ai_request(messages: list) -> str:
+    headers = {"Content-Type": "application/json"}
+    if AI_API_KEY:
+        headers["Authorization"] = f"Bearer {AI_API_KEY}"
+    payload = {"model": AI_MODEL or "openai", "messages": messages, "temperature": 0.2}
+    timeout = aiohttp.ClientTimeout(total=35)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(AI_API_URL, json=payload, headers=headers) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}: {text[:180]}")
+            try:
+                body = json.loads(text)
+            except ValueError as exc:
+                raise RuntimeError("API javobi JSON emas") from exc
+    choices = body.get("choices") or []
+    if not choices:
+        raise RuntimeError("API bo'sh javob qaytardi")
+    message = choices[0].get("message") or {}
+    return str(message.get("content") or "")
+
+
+def local_media_search(query: str, data, limit: int = 5) -> list:
+    """AI ishlamaganda nom/janr/tavsif bo'yicha oddiy o'xshashlik qidiruvi."""
+    norm_query = re.sub(r"[^a-z0-9а-яё]", "", query.casefold())
+    if len(norm_query) < 2:
+        return []
+    words = [w for w in re.findall(r"[a-z0-9а-яё]+", query.casefold()) if len(w) >= 3]
+    scored = []
+    for code, media in data.get("medias", {}).items():
+        if not media_available_for_user(0, media, data):
+            continue
+        name = str(media.get("name") or "")
+        folded = name.casefold()
+        norm_name = re.sub(r"[^a-z0-9а-яё]", "", folded)
+        score = difflib.SequenceMatcher(None, norm_query, norm_name).ratio()
+        haystack = " ".join([folded, str(media.get("genres") or "").casefold(), str(media.get("description") or "").casefold()])
+        if words and all(w in haystack for w in words):
+            score = max(score, 0.75)
+        elif any(w in haystack for w in words):
+            score = max(score, 0.5)
+        if query.casefold() in folded or (len(norm_query) >= 3 and score >= 0.45):
+            scored.append((score, str(code)))
+    scored.sort(key=lambda pair: -pair[0])
+    return [code for _score, code in scored[:limit]]
+
+
+def _ai_results_keyboard(codes: list) -> InlineKeyboardMarkup:
+    data = load_data()
+    icons = {"movie": "🎞", "series": "📺", "drama": "🎭", "anime": "🍥", "cartoon": "🎨"}
+    rows = []
+    for code in codes:
+        media = data.get("medias", {}).get(str(code))
+        if not media:
+            continue
+        icon = icons.get(media.get("media_type"), "🎬")
+        rows.append([InlineKeyboardButton(text=f"{icon} {media.get('name', 'Nomsiz')} · {code}", callback_data=f"show:{code}")])
+    rows.append([InlineKeyboardButton(text="🤖 Yana so'rash", callback_data="ai_mode")])
+    rows.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "ai_mode")
+async def ai_mode_start(call: CallbackQuery, state: FSMContext):
+    data = load_data()
+    if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
+        return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
+    if not await enforce_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
+        return await call.answer()
+    if not _ai_rate_ok(call.from_user.id):
+        return await call.answer("⏳ Biroz kuting, oldingi so'rovingiz qayta ishlanmoqda.", show_alert=True)
+    await state.set_state(Form.ai_query)
+    await call.message.answer(
+        "🤖 <b>AI rejimi</b>\n\n"
+        "Qidirayotgan anime, kino yoki multfilmingizni o'z so'zingiz bilan tasvirlab yozing "
+        "(masalan: «bola o'z oilasini qidiradigan anime»).\n\n"
+        "Yoki rasm/skrinshot yuboring — AI rasmni o'qib, bazadan mos kontentni topadi.\n"
+        "Bekor qilish: /cancel")
+    await call.answer()
+
+
+@dp.message(Form.ai_query)
+async def ai_query_handle(message: Message, state: FSMContext):
+    if not await require_subscription_message(message):
+        await state.clear()
+        return
+    text = (message.text or message.caption or "").strip()
+    photo = message.photo[-1] if message.photo else None
+    if not text and not photo:
+        return await message.answer("✍️ Kontentni so'z bilan tasvirlang yoki rasm yuboring. Bekor qilish: /cancel")
+    data = load_data()
+    catalog = _ai_catalog(data)
+    if not catalog:
+        await state.clear()
+        return await message.answer("📭 Botda hali kontent yo'q. Keyinroq urinib ko'ring.", reply_markup=main_menu(message.from_user.id))
+    valid_codes = {item["code"] for item in catalog}
+    prompt = _ai_prompt(catalog)
+    content = [{"type": "text", "text": (prompt + "\n\nFoydalanuvchi so'rovi: " + (text or "rasmdagi kontent"))}]
+    if photo:
+        try:
+            buffer = io.BytesIO()
+            await bot.download(photo.file_id, destination=buffer)
+            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+        except Exception:
+            logging.exception("AI uchun rasm yuklab olinmadi")
+            await state.clear()
+            return await message.answer(
+                "🖼 Rasmni o'qib bo'lmadi. Iltimos, kontentni so'z bilan tasvirlab yozing:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🤖 AI rejimi", callback_data="ai_mode")]]))
+    status = await message.answer("⏳ AI qidirmoqda, biroz kuting…")
+    reply_text = ""
+    try:
+        reply_text = await _ai_request([{"role": "user", "content": content}])
+        codes = _extract_ai_codes(reply_text, valid_codes) or _ai_guess_from_text(reply_text, catalog)
+    except Exception as exc:
+        logging.warning("AI so'rovi muvaffaqiyatsiz: %s", exc)
+        codes = []
+    fallback_used = False
+    if not codes and text:
+        codes = local_media_search(text, data)
+        fallback_used = bool(codes)
+    await state.clear()
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    if not codes:
+        return await message.answer(
+            "❌ AI mos kontent topa olmadi.\n\n"
+            "Nomni boshqacha tasvirlab ko'ring yoki oddiy nom bo'yicha qidiruvdan foydalaning.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔎 Nom bo'yicha izlash", callback_data="search_name")],
+                [InlineKeyboardButton(text="🤖 Yana AI bilan", callback_data="ai_mode")],
+                [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")],
+            ]))
+    header = "🤖 <b>AI topdi:</b>"
+    if fallback_used:
+        header += "\n<i>AI javob bermadi — nom bo'yicha o'xshash natijalar ko'rsatildi.</i>"
+    await message.answer(f"{header}\nKerakli kontentni tanlang:", reply_markup=_ai_results_keyboard(codes))
+
+
+# ================= TOP KO'RILGANLAR =================
+@dp.callback_query(F.data == "top_viewed")
+async def top_viewed(call: CallbackQuery):
+    data = load_data()
+    if int(call.from_user.id) in [int(x) for x in data.get("banned_users", [])]:
+        return await call.answer("⛔ Botdan foydalanish taqiqlangan.", show_alert=True)
+    if not await enforce_subscription(call.from_user.id):
+        await call.message.answer("🔒 Avval majburiy kanallarga obuna bo'ling yoki 💎 VIP oling.", reply_markup=subscription_keyboard())
+        return await call.answer()
+    items = []
+    for code, media in data.get("medias", {}).items():
+        views = int(media.get("views", 0) or 0)
+        if views <= 0 or not media_available_for_user(call.from_user.id, media, data):
+            continue
+        items.append((str(code), media, views))
+    items.sort(key=lambda row: (-row[2], row[1].get("name", "").casefold()))
+    if not items:
+        return await call.answer("📊 Hozircha ko'rishlar statistikasi yo'q.", show_alert=True)
+    icons = {"movie": "🎞", "series": "📺", "drama": "🎭", "anime": "🍥", "cartoon": "🎨"}
+    medals = ["🥇", "🥈", "🥉"]
+    rows, lines = [], []
+    for idx, (code, media, views) in enumerate(items[:10], start=1):
+        medal = medals[idx - 1] if idx <= 3 else f"{idx}."
+        icon = icons.get(media.get("media_type"), "🎬")
+        label = f"{medal} {icon} {media.get('name', 'Nomsiz')} · 👁 {views}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"show:{code}")])
+        lines.append(f"{medal} {icon} <b>{media.get('name', 'Nomsiz')}</b> · 👁 {views} marta")
+    rows.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
+    text = "🔥 <b>Top 10 ko'rilganlar</b>\n\n" + "\n".join(lines)
+    try:
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    except Exception:
+        await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
 
 
@@ -2956,7 +3705,7 @@ async def admin_permissions_choose(message: Message, state: FSMContext):
     if uid not in data.get("admins", []) and uid not in ADMIN_IDS:
         return await message.answer("⚠️ Bu ID adminlar ro'yxatida yo'q. Avval admin qo'shing:")
     perms = set(get_admin_permissions(uid))
-    labels = [("add_content", "Kontent qo'shish"), ("add_episode", "Qism/sezon qo'shish"), ("edit_content", "Nom/poster tahrirlash"), ("delete_content", "Kontent o'chirish")]
+    labels = [("add_content", "Kontent qo'shish"), ("add_episode", "Qism/sezon qo'shish"), ("edit_content", "Nom/poster tahrirlash"), ("delete_content", "Kontent o'chirish"), ("payments", "To'lovlarni ko'rish/tasdiqlash"), ("emoji", "Tugmalarga premium emoji qo'shish")]
     rows = [[InlineKeyboardButton(text=("✅ " if key in perms else "⬜ ")+label, callback_data=f"perm_toggle:{uid}:{key}")] for key,label in labels]
     rows.append([InlineKeyboardButton(text="✅ Tayyor", callback_data="admin_home")])
     await state.clear()
@@ -2967,13 +3716,13 @@ async def admin_permissions_choose(message: Message, state: FSMContext):
 async def admin_permission_toggle(call: CallbackQuery):
     if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun.", show_alert=True)
     _, uid_raw, perm = call.data.split(":", 2); uid = int(uid_raw)
-    valid = {"add_content", "add_episode", "edit_content", "delete_content"}
+    valid = {"add_content", "add_episode", "edit_content", "delete_content", "payments", "emoji"}
     if perm not in valid: return await call.answer("Noto'g'ri huquq", show_alert=True)
     data = load_data(); permissions = set(data.setdefault("admin_permissions", {}).get(str(uid), ["add_content", "add_episode"]))
     if perm in permissions: permissions.remove(perm)
     else: permissions.add(perm)
     data["admin_permissions"][str(uid)] = sorted(permissions); save_data(data)
-    labels = [("add_content", "Kontent qo'shish"), ("add_episode", "Qism/sezon qo'shish"), ("edit_content", "Nom/poster tahrirlash"), ("delete_content", "Kontent o'chirish")]
+    labels = [("add_content", "Kontent qo'shish"), ("add_episode", "Qism/sezon qo'shish"), ("edit_content", "Nom/poster tahrirlash"), ("delete_content", "Kontent o'chirish"), ("payments", "To'lovlarni ko'rish/tasdiqlash"), ("emoji", "Tugmalarga premium emoji qo'shish")]
     rows = [[InlineKeyboardButton(text=("✅ " if key in permissions else "⬜ ")+label, callback_data=f"perm_toggle:{uid}:{key}")] for key,label in labels]
     rows.append([InlineKeyboardButton(text="✅ Tayyor", callback_data="admin_home")])
     await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -3351,14 +4100,13 @@ async def stats(call: CallbackQuery):
     vip_active = sum(1 for u in users if vip_until_ts(u) > now)
     referral_total = sum(1 for u in users if u.get("referral_qualified"))
     referral_pending = sum(1 for u in users if u.get("referrer") and not u.get("referral_qualified"))
-    referral_rewards = sum(int(u.get("referral_rewards", 0) or 0) for u in users)
     def downloads_in(days):
         return sum(1 for t in downloads.values() if isinstance(t, (int, float)) and t >= now - days * 86400) if isinstance(downloads, dict) else 0
     await call.message.answer(
         f"📊 <b>Statistika</b>\n• Obunachilar soni: {len(users)} ta\n• Faol obunachilar: {active30} ta\n• Tark etganlar: {inactive} ta\n\n"
         f"📈 <b>Obunachilar qo‘shilishi</b>\n• Oxirgi 24 soat: +{joined_in(1)} obunachi\n• Oxirgi 7 kun: +{joined_in(7)} obunachi\n• Oxirgi 30 kun: +{joined_in(30)} obunachi\n\n"
         f"💎 <b>VIP statistikasi</b>\n• VIP olganlar (qayd etilgan): {vip_ever} ta\n• Hozir VIP faol: {vip_active} ta\n\n"
-        f"👥 <b>Referal statistikasi</b>\n• Hisoblangan referallar: {referral_total} ta\n• Obunani kutayotganlar: {referral_pending} ta\n• Berilgan VIP mukofotlar: {referral_rewards} ta\n\n"
+        f"👥 <b>Referal statistikasi</b>\n• Hisoblangan referallar: {referral_total} ta\n• Obunani kutayotganlar: {referral_pending} ta\n\n"
         f"📊 <b>Faollik</b>\n• Oxirgi 24 soatda faol: {seen_in(1)} ta\n• Oxirgi 7 kun faol: {seen_in(7)} ta\n• Oxirgi 30 kun faol: {active30} ta\n\n"
         f"📥 <b>Yuklanishlar</b>\n• Oxirgi 24 soat: {downloads_in(1)} ta\n• Oxirgi 7 kun: {downloads_in(7)} ta\n• Oxirgi 30 kun: {downloads_in(30)} ta\n\n"
         f"🎬 Kinolar soni: {movie_count} ta\n🍥 Anime: {anime_count} ta\n🎨 Multfilm: {cartoon_count} ta\n📺 Serial/drama: {series_count} ta"
@@ -3385,7 +4133,7 @@ async def appearance_menu(call: CallbackQuery):
         [InlineKeyboardButton(text="♻️ Ranglarni tozalash", callback_data="color_reset")],
         [InlineKeyboardButton(text="✏️ Tugma nomlarini o‘zgartirish", callback_data="button_text_menu")],
     ]
-    if is_owner(call.from_user.id):
+    if can_manage_emoji(call.from_user.id):
         rows.append([InlineKeyboardButton(text="😀 Tugmalarga emoji qo‘shish", callback_data="button_emoji_menu")])
     rows.append([InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -3445,6 +4193,12 @@ async def color_reset(call: CallbackQuery):
 EDITABLE_BUTTONS = {
     "search_menu": "🔎 Kino va serial izlash",
     "guide": "📖 Qo‘llanma",
+    "account": "👤 Hisobim",
+    "referral": "👥 Referal",
+    "topup": "💰 Balans to‘ldirish",
+    "contact_admin": "📞 Admin bilan bog‘lanish",
+    "ai_mode": "🤖 AI rejimi",
+    "top_viewed": "🔥 Top ko‘rilganlar",
     "search": "🔢 Kod bo‘yicha qidirish",
     "search_name": "🔠 Nom bo‘yicha qidirish",
     "list": "📚 Kino va seriallar ro‘yxati",
@@ -3458,6 +4212,9 @@ EDITABLE_BUTTONS = {
     "rename_media": "✏️ Nomini o‘zgartirish",
     "recode_media": "🔢 Kodini o‘zgartirish",
     "del_media": "🗑 Kino/serial o‘chirish",
+    "payments": "🧾 To‘lovlar",
+    "payment_card_cfg": "💳 To‘lov kartasi",
+    "edit_admin_contact": "📞 Admin lichkasini o‘zgartirish",
     "stats": "📊 Statistika",
     "broadcast": "📣 Hammaga xabar yuborish",
 }
@@ -3469,10 +4226,14 @@ BUTTON_EMOJI_GROUPS = [
         ("search_menu", "🔎 Anime va Kino izlash"),
         ("account", "👤 Hisobim"),
         ("referral", "👥 Referal"),
+        ("topup", "💰 Balans to'ldirish"),
         ("vip_buy", "💎 VIP olish"),
         ("vip_info", "❓ VIP o'zi nima?"),
+        ("ai_mode", "🤖 AI rejimi"),
+        ("top_viewed", "🔥 Top ko'rilganlar"),
         ("order_new", "🛒 Buyurtma berish"),
         ("complaint_new", "📝 Shikoyat"),
+        ("contact_admin", "📞 Admin bilan bog'lanish"),
         ("guide", "📖 Qo'llanma"),
         ("home", "⬅️ Orqaga / asosiy menyu"),
     ]),
@@ -3495,6 +4256,11 @@ BUTTON_EMOJI_GROUPS = [
         ("del_season", "🗑 Fasl o'chirish"),
         ("rename_media", "✏️ Nom / kodni tahrirlash"),
         ("edit_poster", "🖼 Posterni tahrirlash"),
+        ("payments", "🧾 To'lovlar"),
+        ("payment_card_cfg", "💳 To'lov kartasi"),
+        ("button_emoji_menu", "😀 Tugmalarga emoji qo'shish"),
+        ("contact_admin", "📞 Admin bilan bog'lanish"),
+        ("edit_admin_contact", "📞 Admin lichkasini o'zgartirish"),
         ("stats", "📊 Statistika"),
         ("broadcast", "📣 Hammaga xabar yuborish"),
         ("appearance", "🎨 Tugma ranglari"),
@@ -3507,6 +4273,11 @@ BUTTON_EMOJI_GROUPS = [
     ]),
 ]
 BUTTON_EMOJI_LABELS = {key: label for _, _, items in BUTTON_EMOJI_GROUPS for key, label in items}
+
+
+def can_manage_emoji(user_id: int) -> bool:
+    """Owner va «emoji» huquqi berilgan adminlar tugma emojisini sozlay oladi."""
+    return has_permission(user_id, "emoji")
 
 
 def _button_emoji_mark(value):
@@ -3559,8 +4330,8 @@ async def verify_custom_emoji_support():
 
 @dp.callback_query(F.data == "button_emoji_menu")
 async def button_emoji_menu(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    if not can_manage_emoji(call.from_user.id):
+        return await call.answer("⛔ Sizda emoji sozlash huquqi yo'q", show_alert=True)
     await state.clear()
     saved = load_data().get("settings", {}).get("button_emojis", {})
     rows = []
@@ -3569,7 +4340,7 @@ async def button_emoji_menu(call: CallbackQuery, state: FSMContext):
         suffix = f" · {count} ta" if count else ""
         rows.append([InlineKeyboardButton(text=f"{group_label}{suffix}", callback_data=f"button_emoji_group:{group_key}")])
     rows.append([InlineKeyboardButton(text="♻️ Barcha emojilarni o'chirish", callback_data="button_emoji_reset")])
-    rows.append([InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")])
+    rows.append([InlineKeyboardButton(text="⬅️ Panel", callback_data="admin_home")])
     await call.message.answer(
         "😀 <b>Tugmalarga emoji qo'shish</b>\n"
         "1️⃣ Guruhni tanlang\n2️⃣ Tugmani tanlang\n3️⃣ Premium emoji ID sini yuboring\n\n"
@@ -3584,8 +4355,8 @@ async def button_emoji_menu(call: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("button_emoji_group:"))
 async def button_emoji_group(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    if not can_manage_emoji(call.from_user.id):
+        return await call.answer("⛔ Sizda emoji sozlash huquqi yo'q", show_alert=True)
     await state.clear()
     group_key = call.data.split(":", 1)[1]
     group = next(((label, items) for key, label, items in BUTTON_EMOJI_GROUPS if key == group_key), None)
@@ -3596,7 +4367,8 @@ async def button_emoji_group(call: CallbackQuery, state: FSMContext):
     rows = []
     for key, label in items:
         mark = _button_emoji_mark(saved.get(key))
-        shown = label if len(label) <= 30 else label[:29] + "…"
+        clean = _strip_leading_emoji(label)
+        shown = clean if len(clean) <= 30 else clean[:29] + "…"
         rows.append([InlineKeyboardButton(text=f"{mark} {shown}", callback_data=f"button_emoji_pick:{key}")])
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="button_emoji_menu")])
     await call.message.answer(f"😀 <b>{group_label}</b>\nEmoji qo'shmoqchi bo'lgan tugmani tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -3605,8 +4377,8 @@ async def button_emoji_group(call: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("button_emoji_pick:"))
 async def button_emoji_pick(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    if not can_manage_emoji(call.from_user.id):
+        return await call.answer("⛔ Sizda emoji sozlash huquqi yo'q", show_alert=True)
     key = call.data.split(":", 1)[1]
     if key not in BUTTON_EMOJI_LABELS:
         return await call.answer("⚠️ Tugma topilmadi", show_alert=True)
@@ -3618,10 +4390,10 @@ async def button_emoji_pick(call: CallbackQuery, state: FSMContext):
         rows.append([InlineKeyboardButton(text="🗑 Emojini o'chirish", callback_data=f"button_emoji_del:{key}")])
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="button_emoji_menu")])
     await call.message.answer(
-        f"😀 <b>{BUTTON_EMOJI_LABELS[key]}</b>\nHozirgi emoji: <code>{current}</code>\n\n"
+        f"😀 <b>{_strip_leading_emoji(BUTTON_EMOJI_LABELS[key])}</b>\nHozirgi emoji: <code>{current}</code>\n\n"
         "Premium emoji ID sini yuboring (masalan <code>5368324170671202286</code>) "
         "yoki premium emojining o'zini yuboring.\n"
-        "Oddiy emoji yuborsangiz, u tugma matni boshiga qo'shiladi.\n"
+        "Yuborilgan emoji tugmadagi eski emoji o'rniga qo'yiladi.\n"
         "Bekor qilish: /cancel",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
@@ -3630,9 +4402,9 @@ async def button_emoji_pick(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Form.button_emoji_value)
 async def button_emoji_save(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
+    if not can_manage_emoji(message.from_user.id):
         await state.clear()
-        return await message.answer("⛔ Faqat owner uchun.")
+        return await message.answer("⛔ Sizda emoji sozlash huquqi yo'q.")
     raw = (message.text or "").strip()
     if raw == "/cancel":
         await state.clear()
@@ -3663,19 +4435,19 @@ async def button_emoji_save(message: Message, state: FSMContext):
     save_data(data)
     await state.clear()
     await message.answer(
-        f"✅ <b>{BUTTON_EMOJI_LABELS[key]}</b> tugmasiga emoji saqlandi: <code>{value}</code>\n"
+        f"✅ <b>{_strip_leading_emoji(BUTTON_EMOJI_LABELS[key])}</b> tugmasiga emoji saqlandi: <code>{value}</code>\n"
         "Menyular qayta ochilganda ko'rinadi.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="😀 Yana emoji qo'shish", callback_data="button_emoji_menu")],
-            [InlineKeyboardButton(text="👑 Owner paneli", callback_data="admin_home")],
+            [InlineKeyboardButton(text="⬅️ Panel", callback_data="admin_home")],
         ])
     )
 
 
 @dp.callback_query(F.data.startswith("button_emoji_del:"))
 async def button_emoji_delete(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    if not can_manage_emoji(call.from_user.id):
+        return await call.answer("⛔ Sizda emoji sozlash huquqi yo'q", show_alert=True)
     key = call.data.split(":", 1)[1]
     if key not in BUTTON_EMOJI_LABELS:
         return await call.answer("⚠️ Tugma topilmadi", show_alert=True)
@@ -3686,7 +4458,7 @@ async def button_emoji_delete(call: CallbackQuery, state: FSMContext):
     await call.answer("🗑 Emoji o'chirildi")
     try:
         await call.message.edit_text(
-            f"🗑 <b>{BUTTON_EMOJI_LABELS[key]}</b> tugmasidagi emoji o'chirildi.",
+            f"🗑 <b>{_strip_leading_emoji(BUTTON_EMOJI_LABELS[key])}</b> tugmasidagi emoji o'chirildi.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Emoji menyusi", callback_data="button_emoji_menu")]])
         )
     except Exception:
@@ -3695,8 +4467,8 @@ async def button_emoji_delete(call: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "button_emoji_reset")
 async def button_emoji_reset(call: CallbackQuery, state: FSMContext):
-    if not is_owner(call.from_user.id):
-        return await call.answer("⛔ Faqat owner uchun", show_alert=True)
+    if not can_manage_emoji(call.from_user.id):
+        return await call.answer("⛔ Sizda emoji sozlash huquqi yo'q", show_alert=True)
     data = load_data()
     data.setdefault("settings", {}).pop("button_emojis", None)
     save_data(data)
